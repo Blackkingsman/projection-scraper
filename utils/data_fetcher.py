@@ -21,7 +21,11 @@ class DataFetcher:
         self.headers = {
             
         'Content-Type': 'application/json',
+<<<<<<< HEAD
           'x-api-key': self.XAPI_KEY, 
+=======
+          #'x-api-key': need to upload for environment 
+>>>>>>> origin/main
         }
 
     async def fetch_projections(self, league_ids):
