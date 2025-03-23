@@ -21,7 +21,7 @@ class DataFetcher:
         self.headers = {
             
         'Content-Type': 'application/json',
-          'x-api-key': 'KOMO8gWTJgyf-N8vRB3lGA-SBirPQhzJLFxDEubIwQA9ZagwCgOHJX8i6NDQ67EaRw0', 
+          'x-api-key': self.XAPI_KEY, 
         }
 
     async def fetch_projections(self, league_ids):
