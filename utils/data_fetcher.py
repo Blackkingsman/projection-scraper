@@ -4,11 +4,10 @@ import random
 import os
 from curl_cffi import requests
 import json
-from typing import List
+from typing import Optional, Dict, Any
 class DataFetcher:
 
-    # Global lock to ensure only one fetch request handles the VPN switch at a time
-    vpn_lock = asyncio.Lock()
+
 
     def __init__(self):
         # Session setup for making HTTP requests
@@ -24,41 +23,48 @@ class DataFetcher:
           'x-api-key': self.XAPI_KEY, 
         }
 
-    async def fetch_projections(self, league_ids):
-        """Fetch projections from the ProxyFetch API, sending league_ids in the body."""
+    async def fetch_projections(self, league_id: int, platform: str):
+        """
+        Dispatch projection fetching to the appropriate platform handler.
+        """
         try:
-            # Correctly structure the body
-            body = json.dumps({"league_ids": [league_ids]})
-            logging.info(f"Sending request with body: {body}")
+            if platform == "prizepicks":
+                return await self.fetch_prizepicks_projections(league_id)
+            elif platform == "underdog":
+                return await self.fetch_underdog_projections(league_id)
+            else:
+                raise ValueError(f"[fetch_projections] Unsupported platform '{platform}'.")
+        except Exception as e:
+            logging.error(f"[fetch_projections] Error fetching projections for platform '{platform}': {e}")
+            return []
 
-            # Send the request to ProxyFetch API with the league_ids in the body
+    async def fetch_prizepicks_projections(self, league_id: int):
+        """
+        Fetch projections from the ProxyFetch API for PrizePicks.
+        """
+        try:
+            body = json.dumps({"league_ids": [league_id]})
+            logging.info(f"[fetch_prizepicks_projections] Sending request with body: {body}")
+
             proxyfetch_url = "http://192.168.1.5:8000/fetch-prizepicks"
             response = self.session.post(proxyfetch_url, headers=self.headers, data=body)
 
             if response.status_code == 200:
                 data = response.json().get('projections', [])
-               
-                if data:
-                    logging.info(f"Successfully fetched {len(data[0])} projections.")
-                    return data[0]
-                else:
-                    logging.warning("No projections found in the response.")
-                    return None
-
+                logging.info(f"[fetch_prizepicks_projections] Successfully fetched {len(data[0])} projections.")
+                return data[0]
             elif response.status_code == 403:
-                logging.warning("Access forbidden, retrying...")
-                return await self.fetch_projections(league_ids)
-
+                logging.warning("[fetch_prizepicks_projections] Access forbidden, retrying...")
+                return await self.fetch_prizepicks_projections(league_id)
             else:
-                logging.error(f"Failed to fetch projections, status: {response.status_code}")
-                return None
+                raise RuntimeError(f"[fetch_prizepicks_projections] Failed to fetch: status {response.status_code}")
 
         except Exception as e:
-            logging.error(f"Exception occurred while fetching projections from ProxyFetch: {e}")
-            return None
+            logging.error(f"[fetch_prizepicks_projections] Exception occurred: {e}")
+            return []
 
     #We should not be making this request here we need to pass this off to proxy fetcher
-    async def fetch_player_data(self, player_id):
+    async def fetch_player_data(self, player_id: str) -> Optional[Dict[str, Any]]:
         """Fetch individual player data from the PrizePicks API with a random rate limit (1-3 seconds)."""
         url = f"https://api.prizepicks.com/players/{player_id}"
 
@@ -90,6 +96,5 @@ class DataFetcher:
                 return None
 
         except Exception as e:
-            logging.error(f"Error fetching player {player_id}: {e}")
+            logging.error(f"[fetch_player_data] Error fetching player {player_id}: {e}")
             return None
-
