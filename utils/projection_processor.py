@@ -1,9 +1,11 @@
 import logging
 import time
+import asyncio
+from typing import Dict, Set
+
 from managers.firebase_manager import FirebaseManager
 from managers.cache_manager import CacheManager
 from utils.data_fetcher import DataFetcher
-from typing import Dict
 
 
 class ProjectionProcessor:
@@ -77,32 +79,54 @@ class ProjectionProcessor:
 
         for player_id, proj_data in remaining_projections.items():
             try:
-                player_data = await self.data_fetcher.fetch_player_data(player_id)
-                if player_data:
-                    for proj_id, details in proj_data.items():
-                        if "projections" not in player_data:
-                            player_data["projections"] = {}
-                        player_data["projections"][proj_id] = details
+                raw_data = await self.data_fetcher.fetch_player_data(player_id)
+                logging.debug(f"[fetch_remaining_players] Raw data for {player_id}: {raw_data}")
 
-                    players_with_changes[player_id] = player_data
+                player_data = raw_data.get("player_data") if isinstance(raw_data, dict) else None
 
-                    self.firebase_manager.update_player(player_id, {
-                        "name": player_data.get("name"),
-                        "position": player_data.get("position"),
-                        "team": player_data.get("team"),
-                        "league": player_data.get("league"),
-                        "image_url": player_data.get("image_url")
-                    })
+                if player_data and isinstance(player_data, dict):
+                    name = player_data.get("name") or player_data.get("display_name")
+                    position = player_data.get("position")
+                    team = player_data.get("team")
+                    league = player_data.get("league")
+                    image_url = player_data.get("image_url")
+                    jersey_number = player_data.get("jersey_number")
+
+                    merged_player_data = {
+                        "name": name,
+                        "position": position,
+                        "team": team,
+                        "league": league,
+                        "jersey_number": jersey_number,
+                        "image_url": image_url,
+                        "projections": proj_data
+                    }
+
+                    players_with_changes[player_id] = merged_player_data
+
+                    filtered_player_info = {
+                        "name": name,
+                        "position": position,
+                        "team": team,
+                        "league": league,
+                        "image_url": image_url,
+                        "jersey_number": jersey_number
+                    }
+
+                    logging.info(f"[update_player] Data for {player_id} => {filtered_player_info}")
+                    self.firebase_manager.update_player(player_id, filtered_player_info)
+
                 else:
-                    logging.info(f"[fetch_remaining_players] No data returned for {player_id}")
+                    logging.warning(f"[fetch_remaining_players] No valid player_data found for {player_id}")
+
             except Exception as e:
                 logging.error(f"[fetch_remaining_players] Error fetching player {player_id}: {e}")
 
         if players_with_changes:
-            logging.info(f"[fetch_remaining_players] Uploading {len(players_with_changes)} players to Firebase.")
+            logging.info(f"[fetch_remaining_players] Uploading {len(players_with_changes)} players to Firebase projections ref.")
             self.firebase_manager.update_projections(players_with_changes, ref_path)
 
-    def remove_outdated_projections(self, updated_projection_ids: Dict[str, set], ref_path: str):
+    async def remove_outdated_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str):
         logging.info("[remove_outdated_projections] Checking for outdated projections...")
         projections_to_remove = []
         total_players_checked = 0
@@ -110,15 +134,16 @@ class ProjectionProcessor:
         league = self.firebase_manager._extract_league_from_ref(ref_path)
 
         try:
-            for player_id in updated_projection_ids.keys():
-                cached = self.cache_manager.get_projection_by_league(player_id, self.platform_abbr, league)
-                total_players_checked += 1
-
-                if not cached:
+            for player_id, current_ids in current_projection_map.items():
+                cached_data = self.cache_manager.get_projection_by_league(player_id, self.platform_abbr, league)
+                if not cached_data or "projections" not in cached_data:
                     continue
 
-                for projection_id in list(cached.keys()):
-                    if projection_id not in updated_projection_ids[player_id]:
+                total_players_checked += 1
+                cached_ids = set(cached_data["projections"].keys())
+
+                for projection_id in cached_ids:
+                    if projection_id not in current_ids:
                         projections_to_remove.append((player_id, projection_id))
                         total_projections_removed += 1
 
@@ -126,14 +151,15 @@ class ProjectionProcessor:
                 self.firebase_manager.delete_projections(projections_to_remove, ref_path)
                 logging.info(f"[remove_outdated_projections] Deleted {total_projections_removed} projections from {total_players_checked} players.")
             else:
-                logging.info(f"[remove_outdated_projections] No projections to remove.")
+                logging.info("[remove_outdated_projections] No projections to remove.")
+
         except Exception as e:
             logging.error(f"[remove_outdated_projections] Error: {e}")
 
     def filter_relevant_projections(self, projections, ref_path: str):
         logging.info("[filter_relevant_projections] Filtering projections...")
         filtered_projections = {}
-        updated_projection_ids = {}
+        updated_projection_ids: Dict[str, Set[str]] = {}
 
         new_player_set = set()
         changed_proj_set = set()
@@ -151,14 +177,12 @@ class ProjectionProcessor:
                 stat_type = proj['attributes']['stat_type']
                 status = proj['attributes']['status']
 
-                if player_id not in updated_projection_ids:
-                    updated_projection_ids[player_id] = set()
-                updated_projection_ids[player_id].add(projection_id)
+                updated_projection_ids.setdefault(player_id, set()).add(projection_id)
 
                 cached_proj_data = self.cache_manager.get_projection_by_league(
                     player_id, self.platform_abbr, league
                 )
-                cached_projection = cached_proj_data.get(projection_id) if cached_proj_data else None
+                cached_projection = cached_proj_data.get("projections", {}).get(projection_id) if cached_proj_data else None
 
                 if not cached_projection:
                     new_proj_set.add(player_id)
@@ -184,7 +208,10 @@ class ProjectionProcessor:
                 f"[filter_relevant_projections] New: {len(new_proj_set)}, Changed: {len(changed_proj_set)}"
             )
 
-            self.remove_outdated_projections(updated_projection_ids, ref_path)
+            asyncio.create_task(
+                self.remove_outdated_projections(updated_projection_ids, ref_path)
+            )
+
             return filtered_projections
 
         except Exception as e:
@@ -204,3 +231,4 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[detect_field_changes] Error comparing fields: {e}")
         return changed_fields if changed_fields else None
+

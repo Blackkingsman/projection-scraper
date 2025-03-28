@@ -30,7 +30,7 @@ class FirebaseManager:
         try:
             self.player_ref.child(player_id).update(player_data)
             logging.info(f"Updated player {player_id} in Firebase.")
-            self.cache_manager.set_player(player_id, player_data, self.platform_abbr)
+            self.cache_manager.set_player(player_id, player_data)
         except Exception as e:
             logging.error(f"Failed to update player {player_id}: {e}")
 
@@ -56,8 +56,7 @@ class FirebaseManager:
 
         for player_id, player_data in players_with_changes.items():
             try:
-                projections = player_data.get("projections", {})
-                player_json = json.dumps({player_id: {"projections": projections}})
+                player_json = json.dumps({player_id: player_data})
                 player_size = sys.getsizeof(player_json)
             except Exception as e:
                 logging.error(f"[Serialization] Failed for player {player_id}: {e}")
@@ -73,7 +72,7 @@ class FirebaseManager:
                 chunk = {}
                 chunk_size = 0
 
-            chunk[player_id] = {"projections": projections}
+            chunk[player_id] = player_data
             chunk_size += player_size
 
         if chunk:
@@ -86,15 +85,6 @@ class FirebaseManager:
 
         logging.info(f"✅ Total players successfully updated in Firebase: {len(successfully_uploaded_players)}")
 
-        # ✅ Update projection cache using the correct cache key format
-        league_abbr = self._extract_league_from_ref(ref_path)
-        for player_id, wrapper in successfully_uploaded_players.items():
-            try:
-                projections = wrapper.get("projections", {})
-                self.cache_manager.set_projection(player_id, projections, self.platform_abbr, league_abbr)
-                logging.debug(f"[Cache] Updated cache for projections of player {player_id} (league: {league_abbr}).")
-            except Exception as e:
-                logging.error(f"[Cache] Failed to cache projections for {player_id}: {e}")
 
     def get_projections(self, ref_path: str):
         try:
@@ -113,12 +103,13 @@ class FirebaseManager:
         max_chunk_size = chunk_size_mb * 1024 * 1024
         chunk = {}
         chunk_size = 0
-
+        
         for player_id, projection_id in projections_to_remove:
+            logging.info(f"WE want to remove: {player_id} : {projection_id}")
             chunk[f"{player_id}/projections/{projection_id}"] = None
             player_json = json.dumps({player_id: {projection_id: None}})
             player_size = sys.getsizeof(player_json)
-
+        
             if chunk_size + player_size > max_chunk_size:
                 try:
                     projection_ref.update(chunk)
