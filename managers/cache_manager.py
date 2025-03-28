@@ -1,0 +1,123 @@
+import json
+import logging
+from typing import Optional, Dict, Any
+from cachetools import TTLCache
+
+logger = logging.getLogger("CacheManager")
+
+class CacheManager:
+
+    def __init__(self, platform_abbr: str, maxsize: int = 500_000, ttl: int = 86400):
+        self.cache = TTLCache(maxsize=maxsize, ttl=ttl)
+        self.platform_abbr = platform_abbr.lower()
+        logger.info(f"Initialized in-memory CacheManager for {self.platform_abbr} using cachetools")
+    def get(self, key: str) -> Optional[str]:
+        """
+        Generic getter for raw cache key (for debugging or internal use).
+        """
+        try:
+            return self.cache.get(key)
+        except Exception as e:
+            logger.error(f"[get] Error retrieving key '{key}': {e}")
+            return None
+
+    # --- Player Metadata Caching ---
+
+    def get_player(self, player_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            key = f"{self.platform_abbr}:player:{player_id}"
+            data = self.cache.get(key)
+            return json.loads(data) if data else None
+        except Exception as e:
+            logger.error(f"[get_player] Error for {player_id}: {e}")
+            return None
+
+    def set_player(self, player_id: str, player_data: Dict[str, Any]) -> bool:
+        try:
+            key = f"{self.platform_abbr}:player:{player_id}"
+            self.cache[key] = json.dumps(player_data)
+            return True
+        except Exception as e:
+            logger.error(f"[set_player] Error setting player {player_id}: {e}")
+            return False
+
+    def remove_player(self, player_id: str):
+        key = f"{self.platform_abbr}:player:{player_id}"
+        if key in self.cache:
+            del self.cache[key]
+            logger.info(f"Removed player {player_id} from cache.")
+
+    def player_exists(self, player_id: str) -> bool:
+        key = f"{self.platform_abbr}:player:{player_id}"
+        return key in self.cache
+
+    def bulk_set_players(self, players: Dict[str, Dict[str, Any]]) -> int:
+        count = 0
+        for player_id, player_data in players.items():
+            try:
+                self.cache[f"{self.platform_abbr}:player:{player_id}"] = json.dumps(player_data)
+                count += 1
+            except Exception as e:
+                logger.error(f"Failed to cache player {player_id}: {e}")
+        return count
+
+    def iter_player_keys(self):
+        prefix = f"{self.platform_abbr}:player:"
+        for key in self.cache.keys():
+            if key.startswith(prefix):
+                yield key
+
+    # --- Projections Caching (by platform + league) ---
+
+    def set_projection(self, player_id: str, projections: Dict[str, Any], league_abbr: str) -> bool:
+        try:
+            key = f"{self.platform_abbr}:{league_abbr}:projections:{player_id}"
+            self.cache[key] = json.dumps(projections)
+            return True
+        except Exception as e:
+            logger.error(f"[set_projection] Error for {player_id}: {e}")
+            return False
+
+    def get_projection_by_league(self, player_id: str, platform_abbr: str, league_abbr: str) -> Dict[str, Any]:
+        try:
+            key = f"{platform_abbr}:projections:{league_abbr}:{player_id}"
+            raw = self.cache.get(key)
+            return json.loads(raw) if raw else {}
+        except Exception as e:
+            logger.error(f"[get_projection_by_league] Error for {player_id}: {e}")
+            return {}
+
+
+    def remove_projection(self, player_id: str, projection_id: str, ref_path: str):
+        try:
+            league_abbr = ref_path.replace("prizepicks", "").upper()
+            key = f"{self.platform_abbr}:{league_abbr}:projections:{player_id}"
+            if key in self.cache:
+                data = json.loads(self.cache[key])
+                if projection_id in data:
+                    del data[projection_id]
+                    self.cache[key] = json.dumps(data)
+                    logger.info(f"[remove_projection] Removed projection {projection_id} from player {player_id}")
+        except Exception as e:
+            logger.error(f"[remove_projection] Error removing projection {projection_id} for {player_id}: {e}")
+
+    def set_projection_bulk(
+        self,
+        projections_by_player: Dict[str, Dict[str, Any]],
+        league: str
+    ) -> int:
+        """
+        Bulk cache full player records by player ID.
+        Keys will follow format: {platform_abbr}:projections:{league}:{player_id}
+        """
+        count = 0
+        try:
+            for player_id, player_data in projections_by_player.items():
+                key = f"{self.platform_abbr}:projections:{league}:{player_id}"
+                self.cache[key] = json.dumps(player_data)  # ✅ Entire player record, not just projections
+                count += 1
+            logging.info(f"[set_projection_bulk] Cached {count} full player records for {league.upper()} ({self.platform_abbr})")
+        except Exception as e:
+            logging.error(f"[set_projection_bulk] Failed bulk set: {e}")
+        return count
+
