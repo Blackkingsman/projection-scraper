@@ -2,7 +2,7 @@ import logging
 import time
 import asyncio
 from typing import Dict, Set
-
+from collections import defaultdict
 from managers.firebase_manager import FirebaseManager
 from managers.cache_manager import CacheManager
 from utils.data_fetcher import DataFetcher
@@ -21,34 +21,30 @@ class ProjectionProcessor:
         remaining_projections = {}
 
         try:
-            for player_id, proj_data in projections.items():
-                player_info = self.cache_manager.get_player(player_id)
+            league_abbr = self.firebase_manager._extract_league_from_ref(ref_path)
 
-                filtered_proj_data = {}
-                for proj_id, details in proj_data.items():
-                    filtered_details = {
-                        "line_score": details.get("line_score"),
-                        "start_time": details.get("start_time"),
-                        "stat_type": details.get("stat_type"),
-                        "status": details.get("status")
-                    }
-                    filtered_proj_data[proj_id] = filtered_details
+            for player_id, proj_data in projections.items():
+                # 🧠 Get player metadata (not projection data here!)
+                player_info = self.cache_manager.get_player(player_id)
 
                 if not player_info:
                     logging.info(f"[process_projections] Player {player_id} not found in cache.")
-                    remaining_projections[player_id] = filtered_proj_data
+                    remaining_projections[player_id] = proj_data
                     continue
 
+                # 🧼 Remove fields we don’t want to upload
                 for field in ["created_at", "timestamp", "version", "league_id", "market",
-                              "oddsjam_id", "team_name", "updated_at", "prizepicks_updated_at"]:
+                            "oddsjam_id", "team_name", "updated_at", "prizepicks_updated_at"]:
                     player_info.pop(field, None)
 
-                for proj_id, details in filtered_proj_data.items():
-                    if "projections" not in player_info:
-                        player_info["projections"] = {}
+                # ✅ Merge incoming projections with existing ones
+                existing_proj_data = self.cache_manager.get_projection_by_league(player_id, league_abbr)
+                existing_projections = existing_proj_data.get("projections", {}) if existing_proj_data else {}
+                updated_projections = dict(existing_projections)
 
-                    if proj_id not in player_info["projections"] or player_info["projections"][proj_id] != details:
-                        player_info["projections"][proj_id] = details
+                for proj_id, details in proj_data.items():
+                    if proj_id not in existing_projections or existing_projections[proj_id] != details:
+                        updated_projections[proj_id] = details
                         logging.info(f"[process_projections] Player {player_id} - Projection {proj_id} flagged for update.")
 
                         if player_id not in players_with_changes:
@@ -58,10 +54,10 @@ class ProjectionProcessor:
                                 "team": player_info.get("team"),
                                 "league": player_info.get("league"),
                                 "projections": {},
-                                "jersey_number": player_info.get("jersey_number"),
                                 "image_url": player_info.get("image_url")
                             }
-                        players_with_changes[player_id]["projections"][proj_id] = details
+
+                        players_with_changes[player_id]["projections"] = updated_projections
 
             if players_with_changes:
                 logging.info(f"[process_projections] Uploading {len(players_with_changes)} changed players.")
@@ -72,6 +68,8 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[process_projections] Exception: {e}")
             return {}
+
+
 
     async def fetch_remaining_players(self, remaining_projections, ref_path: str):
         logging.info("[fetch_remaining_players] Fetching missing player data...")
@@ -90,14 +88,13 @@ class ProjectionProcessor:
                     team = player_data.get("team")
                     league = player_data.get("league")
                     image_url = player_data.get("image_url")
-                    jersey_number = player_data.get("jersey_number")
+                   
 
                     merged_player_data = {
                         "name": name,
                         "position": position,
                         "team": team,
                         "league": league,
-                        "jersey_number": jersey_number,
                         "image_url": image_url,
                         "projections": proj_data
                     }
@@ -110,7 +107,6 @@ class ProjectionProcessor:
                         "team": team,
                         "league": league,
                         "image_url": image_url,
-                        "jersey_number": jersey_number
                     }
 
                     logging.info(f"[update_player] Data for {player_id} => {filtered_player_info}")
@@ -129,37 +125,55 @@ class ProjectionProcessor:
     async def remove_outdated_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str):
         logging.info("[remove_outdated_projections] Checking for outdated projections...")
         projections_to_remove = []
-        total_players_checked = 0
-        total_projections_removed = 0
+        players_to_remove_entirely = []
         league = self.firebase_manager._extract_league_from_ref(ref_path)
 
         try:
-            for player_id, current_ids in current_projection_map.items():
-                cached_data = self.cache_manager.get_projection_by_league(player_id, self.platform_abbr, league)
-                if not cached_data or "projections" not in cached_data:
+            cached_players = self.cache_manager.get_all_player_projections_by_league(league)
+
+            for player_id, cached_data in cached_players.items():
+                cached_proj_data = cached_data.get("projections", {})
+                cached_proj_ids = set(cached_proj_data.keys())
+                current_proj_ids = current_projection_map.get(player_id)
+
+                # Case 1 & 3: Player not in API response OR has no projections left
+                if not current_proj_ids:
+                    players_to_remove_entirely.append(player_id)
+                    logging.info(f"[remove_outdated_projections] Player {player_id} has no remaining projections. Marked for full projection node removal.")
                     continue
 
-                total_players_checked += 1
-                cached_ids = set(cached_data["projections"].keys())
+                # Case 2: Player still exists, but some projections are outdated
+                to_remove = [pid for pid in cached_proj_ids if pid not in current_proj_ids]
+                if to_remove:
+                    logging.info(f"[remove_outdated_projections] Player {player_id} projections to remove: {to_remove}")
+                    projections_to_remove.extend([(player_id, pid) for pid in to_remove])
 
-                for projection_id in cached_ids:
-                    if projection_id not in current_ids:
-                        projections_to_remove.append((player_id, projection_id))
-                        total_projections_removed += 1
-
+            # Perform deletions
             if projections_to_remove:
                 self.firebase_manager.delete_projections(projections_to_remove, ref_path)
-                logging.info(f"[remove_outdated_projections] Deleted {total_projections_removed} projections from {total_players_checked} players.")
-            else:
+                logging.info(
+                    f"[remove_outdated_projections] ✅ Deleted {len(projections_to_remove)} projections "
+                    f"from {len(set(p for p, _ in projections_to_remove))} players."
+                )
+
+            if players_to_remove_entirely:
+                self.firebase_manager.delete_entire_player_nodes(players_to_remove_entirely, ref_path)
+                logging.info(
+                    f"[remove_outdated_projections] 🚫 Removed {len(players_to_remove_entirely)} full player projection nodes."
+                )
+
+            if not projections_to_remove and not players_to_remove_entirely:
                 logging.info("[remove_outdated_projections] No projections to remove.")
 
         except Exception as e:
             logging.error(f"[remove_outdated_projections] Error: {e}")
 
+
+
     def filter_relevant_projections(self, projections, ref_path: str):
         logging.info("[filter_relevant_projections] Filtering projections...")
         filtered_projections = {}
-        updated_projection_ids: Dict[str, Set[str]] = {}
+        active_projection_map: Dict[str, Set[str]] = defaultdict(set)
 
         new_player_set = set()
         changed_proj_set = set()
@@ -177,10 +191,10 @@ class ProjectionProcessor:
                 stat_type = proj['attributes']['stat_type']
                 status = proj['attributes']['status']
 
-                updated_projection_ids.setdefault(player_id, set()).add(projection_id)
+                active_projection_map[player_id].add(projection_id)
 
                 cached_proj_data = self.cache_manager.get_projection_by_league(
-                    player_id, self.platform_abbr, league
+                    player_id, league
                 )
                 cached_projection = cached_proj_data.get("projections", {}).get(projection_id) if cached_proj_data else None
 
@@ -209,7 +223,7 @@ class ProjectionProcessor:
             )
 
             asyncio.create_task(
-                self.remove_outdated_projections(updated_projection_ids, ref_path)
+                self.remove_outdated_projections(active_projection_map, ref_path)
             )
 
             return filtered_projections
@@ -217,6 +231,7 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[filter_relevant_projections] Error: {e}")
             return {}
+
 
     def detect_field_changes(self, projection, cached_projection):
         changed_fields = {}

@@ -53,6 +53,7 @@ class FirebaseManager:
         successfully_uploaded_players = {}
 
         logging.info(f"Preparing to update projections for {len(players_with_changes)} players...")
+        league = self._extract_league_from_ref(ref_path)
 
         for player_id, player_data in players_with_changes.items():
             try:
@@ -67,8 +68,13 @@ class FirebaseManager:
                     projection_ref.update(chunk)
                     logging.info(f"[Firebase Upload] Uploaded chunk with {len(chunk)} players.")
                     successfully_uploaded_players.update(chunk)
+
+                    for pid, pdata in chunk.items():
+                        self.cache_manager.set_projection(pid, pdata, league)
+
                 except Exception as e:
                     logging.error(f"[Firebase Upload] Chunk upload failed: {e}")
+
                 chunk = {}
                 chunk_size = 0
 
@@ -80,10 +86,15 @@ class FirebaseManager:
                 projection_ref.update(chunk)
                 logging.info(f"[Firebase Upload] Uploaded final chunk with {len(chunk)} players.")
                 successfully_uploaded_players.update(chunk)
+
+                for pid, pdata in chunk.items():
+                    self.cache_manager.set_projection(pid, pdata, league)
+
             except Exception as e:
                 logging.error(f"[Firebase Upload] Final chunk upload failed: {e}")
 
         logging.info(f"✅ Total players successfully updated in Firebase: {len(successfully_uploaded_players)}")
+
 
 
     def get_projections(self, ref_path: str):
@@ -100,25 +111,26 @@ class FirebaseManager:
             return
 
         projection_ref = self._get_projection_ref(ref_path)
+        league_abbr = self._extract_league_from_ref(ref_path)  # 🔹 New line
         max_chunk_size = chunk_size_mb * 1024 * 1024
         chunk = {}
         chunk_size = 0
-        
+
         for player_id, projection_id in projections_to_remove:
-            logging.info(f"WE want to remove: {player_id} : {projection_id}")
+            logging.info(f"🗑️ Queued for deletion -> Player: {player_id}, Projection: {projection_id}")
             chunk[f"{player_id}/projections/{projection_id}"] = None
             player_json = json.dumps({player_id: {projection_id: None}})
             player_size = sys.getsizeof(player_json)
-        
+
             if chunk_size + player_size > max_chunk_size:
                 try:
                     projection_ref.update(chunk)
-                    logging.info(f"Deleted {len(chunk)} projections.")
+                    logging.info(f"✅ Deleted {len(chunk)} projections from Firebase.")
                     for path in chunk.keys():
                         p_id, proj_id = path.split('/projections/')
-                        self.cache_manager.remove_projection(p_id, proj_id, ref_path)
+                        self.cache_manager.remove_projection(p_id, proj_id, league_abbr)  # 🔹 Updated
                 except Exception as e:
-                    logging.error(f"Error deleting chunk of projections: {e}")
+                    logging.error(f"❌ Error deleting chunk of projections: {e}")
                 chunk = {}
                 chunk_size = 0
 
@@ -127,12 +139,53 @@ class FirebaseManager:
         if chunk:
             try:
                 projection_ref.update(chunk)
-                logging.info(f"Deleted remaining {len(chunk)} projections.")
+                logging.info(f"✅ Deleted final {len(chunk)} projections from Firebase.")
                 for path in chunk.keys():
                     p_id, proj_id = path.split('/projections/')
-                    self.cache_manager.remove_projection(p_id, proj_id, ref_path)
+                    self.cache_manager.remove_projection(p_id, proj_id, league_abbr)  # 🔹 Updated
             except Exception as e:
-                logging.error(f"Error deleting remaining projections: {e}")
+                logging.error(f"❌ Error deleting remaining projections: {e}")
+    def delete_entire_player_nodes(self, player_ids: list[str], ref_path: str, chunk_size_mb: int = 16):
+        if not player_ids:
+            logging.info("[delete_entire_player_nodes] No player nodes to delete.")
+            return
+
+        projection_ref = self._get_projection_ref(ref_path)
+        max_chunk_size = chunk_size_mb * 1024 * 1024
+        chunk = {}
+        chunk_size = 0
+
+        league = self._extract_league_from_ref(ref_path)
+
+        try:
+            for player_id in player_ids:
+                path = f"{player_id}"
+                chunk[path] = None
+
+                # Estimate size
+                player_json = json.dumps({path: None})
+                player_size = sys.getsizeof(player_json)
+
+                if chunk_size + player_size > max_chunk_size:
+                    projection_ref.update(chunk)
+                    logging.info(f"[delete_entire_player_nodes] Deleted {len(chunk)} player projection nodes.")
+                    for pid in chunk.keys():
+                        self.cache_manager.remove_player_projections(pid, league)
+                    chunk = {}
+                    chunk_size = 0
+
+                chunk_size += player_size
+
+            # Final chunk
+            if chunk:
+                projection_ref.update(chunk)
+                logging.info(f"[delete_entire_player_nodes] Deleted final {len(chunk)} player projection nodes.")
+                for pid in chunk.keys():
+                    self.cache_manager.remove_player_projections(pid, league)
+
+        except Exception as e:
+            logging.error(f"[delete_entire_player_nodes] Error deleting player projection nodes: {e}")
+
 
     def _extract_league_from_ref(self, ref_path: str) -> str:
         """

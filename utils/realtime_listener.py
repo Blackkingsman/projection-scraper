@@ -35,7 +35,7 @@ class RealtimeListener:
             logging.info(f"[warm_up_projections_from_firebase] Cached {count} full player entries from '{ref_path}'.")
 
             for player_id in projections_snapshot:
-                sample_key = f"{self.platform_abbr}:projections:{league}:{player_id}"
+                sample_key = f"{self.platform_abbr}:projections:{league}:{400000000}"
                 raw = self.cache_manager.get(sample_key)
                 logging.info(f"[Sample Cached Entry] {sample_key} = {raw}")
                 break

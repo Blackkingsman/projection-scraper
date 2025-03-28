@@ -11,10 +11,8 @@ class CacheManager:
         self.cache = TTLCache(maxsize=maxsize, ttl=ttl)
         self.platform_abbr = platform_abbr.lower()
         logger.info(f"Initialized in-memory CacheManager for {self.platform_abbr} using cachetools")
+
     def get(self, key: str) -> Optional[str]:
-        """
-        Generic getter for raw cache key (for debugging or internal use).
-        """
         try:
             return self.cache.get(key)
         except Exception as e:
@@ -69,43 +67,85 @@ class CacheManager:
 
     # --- Projections Caching (by platform + league) ---
 
-    def set_projection(self, player_id: str, projections: Dict[str, Any], league_abbr: str) -> bool:
+    def set_projection(self, player_id: str, player_data: Dict[str, Any], league_abbr: str) -> bool:
+        """
+        Stores the entire player record including projections in cache.
+        """
         try:
-            key = f"{self.platform_abbr}:{league_abbr}:projections:{player_id}"
-            self.cache[key] = json.dumps(projections)
+            key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
+            self.cache[key] = json.dumps(player_data)
             return True
         except Exception as e:
             logger.error(f"[set_projection] Error for {player_id}: {e}")
             return False
 
-    def get_projection_by_league(self, player_id: str, platform_abbr: str, league_abbr: str) -> Dict[str, Any]:
+    def get_projection_by_league(self, player_id: str, league_abbr: str) -> Dict[str, Any]:
         try:
-            key = f"{platform_abbr}:projections:{league_abbr}:{player_id}"
+            key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
             raw = self.cache.get(key)
             return json.loads(raw) if raw else {}
         except Exception as e:
             logger.error(f"[get_projection_by_league] Error for {player_id}: {e}")
             return {}
 
+    def get_all_player_projections_by_league(self, league_abbr: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Retrieve all cached player projection data for a specific league.
+        Keys are of format: {platform_abbr}:projections:{league_abbr}:{player_id}
+        """
+        result = {}
+        prefix = f"{self.platform_abbr}:projections:{league_abbr.upper()}:"
 
-    def remove_projection(self, player_id: str, projection_id: str, ref_path: str):
         try:
-            league_abbr = ref_path.replace("prizepicks", "").upper()
-            key = f"{self.platform_abbr}:{league_abbr}:projections:{player_id}"
+            for key in self.cache.keys():
+                if key.startswith(prefix):
+                    try:
+                        player_id = key.split(":")[-1]
+                        raw = self.cache[key]
+                        result[player_id] = json.loads(raw)
+                    except Exception as inner_e:
+                        logger.warning(f"[get_all_player_projections_by_league] Failed to parse key '{key}': {inner_e}")
+        except Exception as e:
+            logger.error(f"[get_all_player_projections_by_league] Error during scan: {e}")
+
+        logger.info(f"[get_all_player_projections_by_league] Retrieved {len(result)} players from cache for {league_abbr.upper()}")
+        return result
+
+    def remove_player_projections(self, player_id: str, league_abbr: str):
+        try:
+            key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
+            if key in self.cache:
+                del self.cache[key]
+                logger.info(f"[remove_player_projections] Entire projection node removed for player {player_id}.")
+            else:
+                logger.debug(f"[remove_player_projections] No cache entry found for player {player_id}.")
+        except Exception as e:
+            logger.error(f"[remove_player_projections] Error removing full projection node for player {player_id}: {e}")
+
+    def remove_projection(self, player_id: str, projection_id: str, league_abbr: str):
+        try:
+            key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
+
             if key in self.cache:
                 data = json.loads(self.cache[key])
-                if projection_id in data:
-                    del data[projection_id]
-                    self.cache[key] = json.dumps(data)
-                    logger.info(f"[remove_projection] Removed projection {projection_id} from player {player_id}")
+                projections = data.get("projections", {})
+
+                if projection_id in projections:
+                    del projections[projection_id]
+
+                    if not projections:
+                        del self.cache[key]
+                        logger.info(f"[remove_projection] No more projections for {player_id}. Key removed from cache.")
+                    else:
+                        data["projections"] = projections
+                        self.cache[key] = json.dumps(data)
+                        logger.info(f"[remove_projection] Removed projection {projection_id} from player {player_id}.")
+                else:
+                    logger.debug(f"[remove_projection] Projection {projection_id} not found for player {player_id}.")
         except Exception as e:
             logger.error(f"[remove_projection] Error removing projection {projection_id} for {player_id}: {e}")
 
-    def set_projection_bulk(
-        self,
-        projections_by_player: Dict[str, Dict[str, Any]],
-        league: str
-    ) -> int:
+    def set_projection_bulk(self, projections_by_player: Dict[str, Dict[str, Any]], league: str) -> int:
         """
         Bulk cache full player records by player ID.
         Keys will follow format: {platform_abbr}:projections:{league}:{player_id}
@@ -114,10 +154,9 @@ class CacheManager:
         try:
             for player_id, player_data in projections_by_player.items():
                 key = f"{self.platform_abbr}:projections:{league}:{player_id}"
-                self.cache[key] = json.dumps(player_data)  # ✅ Entire player record, not just projections
+                self.cache[key] = json.dumps(player_data)
                 count += 1
             logging.info(f"[set_projection_bulk] Cached {count} full player records for {league.upper()} ({self.platform_abbr})")
         except Exception as e:
             logging.error(f"[set_projection_bulk] Failed bulk set: {e}")
         return count
-
