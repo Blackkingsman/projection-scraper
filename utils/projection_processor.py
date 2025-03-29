@@ -14,7 +14,14 @@ class ProjectionProcessor:
         self.firebase_manager = firebase_manager
         self.data_fetcher = data_fetcher
         self.platform_abbr = platform_abbr
-
+        
+    @staticmethod
+    def is_player_info_complete(player_info: dict) -> bool:
+        required_fields = ["name", "position", "team", "league"]
+        image_url = player_info.get("image_url")
+        
+        return all(player_info.get(field) for field in required_fields) and image_url is not None
+    
     def process_projections(self, projections, ref_path: str):
         logging.info("[process_projections] Starting to process projections...")
         players_with_changes = {}
@@ -24,20 +31,17 @@ class ProjectionProcessor:
             league_abbr = self.firebase_manager._extract_league_from_ref(ref_path)
 
             for player_id, proj_data in projections.items():
-                # 🧠 Get player metadata (not projection data here!)
                 player_info = self.cache_manager.get_player(player_id)
 
-                if not player_info:
-                    logging.info(f"[process_projections] Player {player_id} not found in cache.")
+                if not self.is_player_info_complete(player_info or {}):
+                    logging.info(f"[process_projections] Player {player_id} has incomplete metadata. Deferring to fetch...")
                     remaining_projections[player_id] = proj_data
                     continue
 
-                # 🧼 Remove fields we don’t want to upload
                 for field in ["created_at", "timestamp", "version", "league_id", "market",
                             "oddsjam_id", "team_name", "updated_at", "prizepicks_updated_at"]:
                     player_info.pop(field, None)
 
-                # ✅ Merge incoming projections with existing ones
                 existing_proj_data = self.cache_manager.get_projection_by_league(player_id, league_abbr)
                 existing_projections = existing_proj_data.get("projections", {}) if existing_proj_data else {}
                 updated_projections = dict(existing_projections)
@@ -53,8 +57,8 @@ class ProjectionProcessor:
                                 "position": player_info.get("position"),
                                 "team": player_info.get("team"),
                                 "league": player_info.get("league"),
-                                "projections": {},
-                                "image_url": player_info.get("image_url")
+                                "image_url": player_info.get("image_url"),
+                                "projections": {}
                             }
 
                         players_with_changes[player_id]["projections"] = updated_projections
@@ -68,8 +72,6 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[process_projections] Exception: {e}")
             return {}
-
-
 
     async def fetch_remaining_players(self, remaining_projections, ref_path: str):
         logging.info("[fetch_remaining_players] Fetching missing player data...")
@@ -87,8 +89,7 @@ class ProjectionProcessor:
                     position = player_data.get("position")
                     team = player_data.get("team")
                     league = player_data.get("league")
-                    image_url = player_data.get("image_url")
-                   
+                    image_url = player_data.get("image_url") or "__missing__"
 
                     merged_player_data = {
                         "name": name,
@@ -106,7 +107,7 @@ class ProjectionProcessor:
                         "position": position,
                         "team": team,
                         "league": league,
-                        "image_url": image_url,
+                        "image_url": image_url
                     }
 
                     logging.info(f"[update_player] Data for {player_id} => {filtered_player_info}")
