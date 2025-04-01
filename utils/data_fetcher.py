@@ -1,25 +1,30 @@
 import logging
-import requests as requests  # avoid name clash with curl_cffi.requests
+import os
 from typing import Optional, Dict, Any
 import httpx
-class DataFetcher:
-    def __init__(self, platform_abbr:str):
-        # Session setup for making HTTP requests
-        self.session = requests.Session()
-        self.platform_abbr = platform_abbr
-        # Fetch the API key from environment variables
-        self.XAPI_KEY = "KOMO8gWTJgyf-N8vRB3lGA-SBirPQhzJLFxDEubIwQA9ZagwCgOHJX8i6NDQ67EaRw0"
+from dotenv import load_dotenv
+from pathlib import Path
 
-        # Headers template for ProxyFetch API requests
+# Correctly resolve the path to the `.env` file
+dotenv_path = Path(__file__).resolve().parent.parent / "config" / ".env"
+load_dotenv(dotenv_path=dotenv_path)
+
+class DataFetcher:
+    def __init__(self, platform_abbr: str):
+        self.platform_abbr = platform_abbr
+
+        self.XAPI_KEY = os.getenv('PRIZEPICKS_SCRAPER_KEY')
+        if not self.XAPI_KEY:
+            raise EnvironmentError("PRIZEPICKS_SCRAPER_KEY environment variable must be set!")
+
+        self.BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+
         self.headers = {
-            
-        'Content-Type': 'application/json',
-          'x-api-key': self.XAPI_KEY, 
+            'Content-Type': 'application/json',
+            'x-api-key': self.XAPI_KEY,
         }
+
     async def fetch_projections(self, league_id: int, platform: str):
-        """
-        Dispatch projection fetching to the appropriate platform handler.
-        """
         try:
             if platform == "prizepicks":
                 return await self.fetch_prizepicks_projections(league_id)
@@ -28,68 +33,84 @@ class DataFetcher:
             else:
                 raise ValueError(f"[fetch_projections] Unsupported platform '{platform}'.")
         except Exception as e:
-            logging.error(f"[fetch_projections] Error fetching projections for platform '{platform}': {e}")
+            logging.error(f"[fetch_projections] Error fetching projections: {e}")
             return []
+
     async def fetch_prizepicks_projections(self, league_id: int):
-        """
-        Fetch projections from the ProxyFetch API for PrizePicks using httpx (async).
-        """
+        endpoint = f"{self.BASE_URL}/fetch-prizepicks"
         try:
             league_id = int(league_id)
-            logging.info(f"[fetch_prizepicks_projections] Sending request for league_id: {league_id}")
+            logging.info(f"[fetch_prizepicks_projections] Requesting league_id: {league_id}")
 
-            proxyfetch_url = "http://192.168.1.5:8000/fetch-prizepicks"
+            # Explicitly set timeout to 10 seconds
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(endpoint, headers=self.headers, json={"league_id": league_id})
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    proxyfetch_url,
-                    headers=self.headers,
-                    json={"league_id": league_id}
-                )
-
-            if response.status_code == 200:
-                data = response.json().get('projections', [])
-                if isinstance(data, list) and len(data) > 0:
-                    logging.info(f"[fetch_prizepicks_projections] Successfully fetched {len(data)} projections.")
-                    return data
-                else:
-                    logging.warning("[fetch_prizepicks_projections] No projections returned.")
-                    return []
-
-            elif response.status_code == 403:
-                logging.warning("[fetch_prizepicks_projections] Access forbidden, retrying...")
-                return await self.fetch_prizepicks_projections(league_id)
-
+            response.raise_for_status()
+            data = response.json().get('projections', [])
+            if data:
+                logging.info(f"[fetch_prizepicks_projections] Retrieved {len(data)} projections.")
             else:
-                raise RuntimeError(f"[fetch_prizepicks_projections] Failed to fetch: status {response.status_code}")
+                logging.warning("[fetch_prizepicks_projections] No projections found.")
+            return data
 
-        except Exception as e:
-            logging.error(f"[fetch_prizepicks_projections] Exception occurred: {e}")
+        except httpx.HTTPError as e:
+            logging.error(f"[fetch_prizepicks_projections] HTTP error: {e}")
             return []
-    async def fetch_player_data(self, player_id: str) -> Optional[Dict[str, Any]]:
+        except Exception as e:
+            logging.error(f"[fetch_prizepicks_projections] Exception: {e}")
+            return []
+
+    async def fetch_underdog_projections(self, league_id: int):
+        endpoint = f"{self.BASE_URL}/fetch-underdog"
         try:
-            if self.platform_abbr == "pp":
-                url = "http://192.168.1.5:8000/fetch-prizepicks-player"
-            elif self.platform_abbr == "ud":
-                url = "http://192.168.1.5:8000/fetch-underdog-player"
-            else:
-                raise ValueError(f"[fetch_player_data] Unsupported platform abbreviation: {self.platform_abbr}")
+            league_id = int(league_id)
+            logging.info(f"[fetch_underdog_projections] Requesting league_id: {league_id}")
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(url, headers=self.headers, json={"player_id": player_id})
+            # Explicitly set timeout to 10 seconds
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(endpoint, headers=self.headers, json={"league_id": league_id})
 
-            if response.status_code == 200:
-                data = response.json()
-                if data:
-                    logging.info(f"Successfully fetched data for player {player_id} via ProxyFetch ({self.platform_abbr}).")
-                    return data
-                else:
-                    logging.warning(f"No data found for player {player_id}.")
-                    return None
+            response.raise_for_status()
+            data = response.json().get('projections', [])
+            if data:
+                logging.info(f"[fetch_underdog_projections] Retrieved {len(data)} projections.")
             else:
-                logging.error(f"ProxyFetch returned {response.status_code} for player {player_id}")
+                logging.warning("[fetch_underdog_projections] No projections found.")
+            return data
+
+        except httpx.HTTPError as e:
+            logging.error(f"[fetch_underdog_projections] HTTP error: {e}")
+            return []
+        except Exception as e:
+            logging.error(f"[fetch_underdog_projections] Exception: {e}")
+            return []
+
+    async def fetch_player_data(self, player_id: str) -> Optional[Dict[str, Any]]:
+        if self.platform_abbr == "pp":
+            endpoint = f"{self.BASE_URL}/fetch-prizepicks-player"
+        elif self.platform_abbr == "ud":
+            endpoint = f"{self.BASE_URL}/fetch-underdog-player"
+        else:
+            raise ValueError(f"[fetch_player_data] Unsupported platform: {self.platform_abbr}")
+
+        try:
+            # Explicitly set timeout to 10 seconds
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(endpoint, headers=self.headers, json={"player_id": player_id})
+
+            response.raise_for_status()
+            data = response.json()
+            if data:
+                logging.info(f"[fetch_player_data] Player data retrieved: {player_id}")
+                return data
+            else:
+                logging.warning(f"[fetch_player_data] No data for player {player_id}")
                 return None
 
+        except httpx.HTTPError as e:
+            logging.error(f"[fetch_player_data] HTTP error for player {player_id}: {e}")
+            return None
         except Exception as e:
-            logging.error(f"[fetch_player_data] Error calling ProxyFetch for {player_id}: {e}")
+            logging.error(f"[fetch_player_data] Exception for player {player_id}: {e}")
             return None

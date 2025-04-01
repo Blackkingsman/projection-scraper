@@ -87,6 +87,16 @@ class CacheManager:
         except Exception as e:
             logger.error(f"[get_projection_by_league] Error for {player_id}: {e}")
             return {}
+    def clear_projections_for_league(self, league: str) -> int:
+        """
+        Clears all cached projections for a given league/platform combo.
+        Returns the number of entries removed.
+        """
+        prefix = f"{self.platform_abbr}:projections:{league}:"
+        keys_to_delete = [key for key in self.cache if key.startswith(prefix)]
+        for key in keys_to_delete:
+            del self.cache[key]
+        return len(keys_to_delete)
 
     def get_all_player_projections_by_league(self, league_abbr: str) -> Dict[str, Dict[str, Any]]:
         """

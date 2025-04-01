@@ -96,6 +96,21 @@ class FirebaseManager:
         logging.info(f"✅ Total players successfully updated in Firebase: {len(successfully_uploaded_players)}")
 
 
+    def set_projections(self, ref_path: str, data: dict | None):
+        """
+        Sets or deletes projections at the given path. If data is None, deletes the node.
+        """
+        try:
+            ref = self._get_projection_ref(ref_path)
+            if data is None:
+                ref.delete()  # ✅ correct way to remove a node
+                logging.info(f"[set_projections] Deleted projections at '{ref_path}'")
+            else:
+                ref.set(data)
+                logging.info(f"[set_projections] Set projections at '{ref_path}'")
+        except Exception as e:
+            logging.error(f"[set_projections] Failed to set projections at {ref_path}: {e}")
+
 
     def get_projections(self, ref_path: str):
         try:

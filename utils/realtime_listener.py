@@ -42,6 +42,30 @@ class RealtimeListener:
 
         except Exception as e:
             logging.error(f"[warm_up_projections_from_firebase] Error warming projection cache: {e}")
+            
+    def cleanup_projections_by_league(self, ref_path: str):
+        """
+        Clear the projection cache and wipe Firebase data for a given league reference.
+        """
+        try:
+            logging.info(f"[cleanup_projections_by_league] Cleaning cache and Firebase data for ref: {ref_path}")
+
+            league = self.firebase_manager._extract_league_from_ref(ref_path)
+
+            # Clear cache
+            cleared_count = self.cache_manager.clear_projections_for_league(league)
+
+            logging.info(f"[cleanup_projections_by_league] Cleared {cleared_count} cached projections for league '{league}'.")
+
+            # Delete from Firebase
+            self.firebase_manager.set_projections(ref_path, None)
+
+            logging.info(f"[cleanup_projections_by_league] Firebase projections cleared at '{ref_path}'.")
+
+        except Exception as e:
+            logging.error(f"[cleanup_projections_by_league] Error during cleanup: {e}")
+
+        
 
     def warm_up_players_from_firebase(self):
         """

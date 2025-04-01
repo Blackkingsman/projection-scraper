@@ -1,3 +1,5 @@
+import os
+import json
 import random
 import asyncio
 import logging
@@ -30,7 +32,6 @@ PLATFORM_CONFIG = {
     }
 }
 
-# Select platform for current run (modular and easy to add more platforms in the future)
 selected_platform = Platform.PRIZEPICKS
 config = PLATFORM_CONFIG[selected_platform]
 
@@ -87,13 +88,10 @@ def dispatcher_callback(sport_name: str, active: bool, league_id: str, loop: asy
 
 async def monitor_sport(sport_name: str, league_id: str, projection_ref: str):
     logging.info(f"🟢 Monitor for {sport_name} started with League ID {league_id}.")
-
-    # 🧊 Warm projections for this sport from Firebase if they exist
     realtime_listener.warm_up_projections_from_firebase(projection_ref)
 
     try:
         while not shutdown_event.is_set():
-
             try:
                 projections = await data_fetcher.fetch_projections(league_id, selected_platform.value.lower())
             except Exception as e:
@@ -104,11 +102,9 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str):
 
             if projections:
                 filtered_projections = projection_processor.filter_relevant_projections(projections, projection_ref)
-
                 if filtered_projections:
                     logging.info(f"[{sport_name}] 📊 Processing {len(filtered_projections)} projections.")
                     remaining_projections = projection_processor.process_projections(filtered_projections, projection_ref)
-
                     if remaining_projections:
                         logging.info(f"[{sport_name}] 🔍 Fetching additional data for {len(remaining_projections)} players.")
                         await projection_processor.fetch_remaining_players(remaining_projections, projection_ref)
@@ -123,6 +119,9 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str):
 
     except asyncio.CancelledError:
         logging.info(f"🛑 Monitoring for {sport_name} cancelled gracefully.")
+        if not shutdown_event.is_set():
+            realtime_listener.cleanup_projections_by_league(projection_ref)
+        raise
     finally:
         logging.info(f"🔚 {sport_name} monitoring task has stopped.")
 
@@ -152,7 +151,6 @@ async def main_async_loop():
         await asyncio.sleep(10)
 
     logging.info("Main loop received shutdown signal, cleaning up...")
-
     firestore_manager.stop_listener()
 
     for sport, future in sport_tasks.items():
@@ -168,7 +166,6 @@ async def main_async_loop():
 
 if __name__ == "__main__":
     signal_handler.register_signal_handlers()
-
     try:
         asyncio.run(main_async_loop())
     except KeyboardInterrupt:
