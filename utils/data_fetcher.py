@@ -114,3 +114,36 @@ class DataFetcher:
         except Exception as e:
             logging.error(f"[fetch_player_data] Exception for player {player_id}: {e}")
             return None
+
+    async def fetch_game_info(self, game_ids: list[str], batch_size: int = 50) -> list[dict]:
+        """
+        Fetch raw game information for a list of game IDs in batches.
+        """
+        endpoint = f"{self.BASE_URL}/games"
+        all_game_details = []
+
+        try:
+            num_batches = (len(game_ids) + batch_size - 1) // batch_size  # Calculate number of batches
+            for i in range(num_batches):
+                batch = game_ids[i * batch_size:(i + 1) * batch_size]
+                logging.info(f"[fetch_game_info] Fetching batch {i + 1}/{num_batches} with {len(batch)} game IDs.")
+
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(
+                        endpoint,
+                        headers=self.headers,
+                        params={"external_game_ids": ",".join(batch), "limit": batch_size}
+                    )
+                response.raise_for_status()
+                batch_data = response.json().get('data', [])
+                all_game_details.extend(batch_data)
+
+            logging.info(f"[fetch_game_info] Retrieved details for {len(all_game_details)} games.")
+            return all_game_details
+
+        except httpx.HTTPError as e:
+            logging.error(f"[fetch_game_info] HTTP error: {e}")
+            return []
+        except Exception as e:
+            logging.error(f"[fetch_game_info] Unexpected error: {e}")
+            return []

@@ -104,7 +104,12 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str):
                 filtered_projections = projection_processor.filter_relevant_projections(projections, projection_ref)
                 if filtered_projections:
                     logging.info(f"[{sport_name}] 📊 Processing {len(filtered_projections)} projections.")
-                    remaining_projections = projection_processor.process_projections(filtered_projections, projection_ref)
+                    try:
+                        remaining_projections = await projection_processor.process_projections(filtered_projections, projection_ref)
+                    except Exception as e:
+                        logging.error(f"[{sport_name}] ❌ Error in process_projections: {e}")
+                        remaining_projections = None
+
                     if remaining_projections:
                         logging.info(f"[{sport_name}] 🔍 Fetching additional data for {len(remaining_projections)} players.")
                         await projection_processor.fetch_remaining_players(remaining_projections, projection_ref)
