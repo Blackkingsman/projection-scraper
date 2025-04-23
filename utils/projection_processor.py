@@ -1,7 +1,7 @@
 import logging
 import time
 import asyncio
-from typing import Dict, Set
+from typing import Dict, Set, Optional
 from collections import defaultdict
 from managers.firebase_manager import FirebaseManager
 from managers.cache_manager import CacheManager
@@ -9,53 +9,79 @@ from utils.data_fetcher import DataFetcher
 
 
 class ProjectionProcessor:
+    """
+    Processes player projections, manages consistency checks, and updates Firebase.
+    """
+
     def __init__(self, cache_manager: CacheManager, firebase_manager: FirebaseManager, data_fetcher: DataFetcher, platform_abbr: str):
+        """
+        Initialize the ProjectionProcessor.
+
+        Args:
+            cache_manager (CacheManager): Handles Redis caching.
+            firebase_manager (FirebaseManager): Manages Firebase interactions.
+            data_fetcher (DataFetcher): Fetches data from external APIs.
+            platform_abbr (str): Abbreviation for the platform (e.g., "pp" for PrizePicks).
+        """
         self.cache_manager = cache_manager
         self.firebase_manager = firebase_manager
         self.data_fetcher = data_fetcher
         self.platform_abbr = platform_abbr
-        
+
     @staticmethod
     def is_player_info_complete(player_info: dict) -> bool:
+        """
+        Check if player metadata contains all required fields.
+        Helper function because when I initialy made the playerdb I didnt include all the fields 
+        that I needed so this is my way of fixing it overtime.
+        Args:
+            player_info (dict): Player metadata.
+
+        Returns:
+            bool: True if all required fields are present, False otherwise.
+        """
         required_fields = ["name", "position", "team", "league"]
         image_url = player_info.get("image_url")
-        
         return all(player_info.get(field) for field in required_fields) and image_url is not None
-    
-    async def process_projections(self, projections, ref_path: str):
-        logging.info("[process_projections] Entered process_projections function.")
+
+    async def process_projections(self, projections: dict, ref_path: str) -> dict:
+        """
+        Process player projections, determine top-level consistency, and upload changes to Firebase.
+
+        Args:
+            projections (dict): Projections grouped by player ID.
+            ref_path (str): Firebase reference path for projections.
+
+        Returns:
+            dict: Remaining projections for players with incomplete metadata.
+        """
+        logging.info("[process_projections] Starting projection processing...")
         players_with_changes = {}
         remaining_projections = {}
 
         try:
-            logging.info(f"[process_projections] Number of projections to process: {len(projections)}")
+            logging.debug(f"[process_projections] Total projections to process: {len(projections)}")
             league_abbr = self.firebase_manager._extract_league_from_ref(ref_path)
 
-            # Collect all unique game_ids for batch fetching
-            game_ids = set()
-            for player_id, proj_data in projections.items():
-                for proj_id, details in proj_data.items():
-                    game_id = details.get("game_id")
-                    if game_id:
-                        game_ids.add(game_id)
+            # Collect unique game IDs for batch fetching
+            game_ids = {details.get("game_id") for proj_data in projections.values() for details in proj_data.values() if details.get("game_id")}
+            logging.info(f"[process_projections] Found {len(game_ids)} unique game IDs.")
 
-            logging.info(f"[process_projections] Collected game_ids: {game_ids}")
-
-            # Fetch game information in batches
+            # Fetch game information
             game_info_data = await self.data_fetcher.fetch_game_info(list(game_ids))
             game_mapping = {game['attributes']['external_game_id']: game['attributes']['metadata'] for game in game_info_data}
 
             for player_id, proj_data in projections.items():
-                logging.info(f"[process_projections] Processing player_id: {player_id}")
+                logging.debug(f"[process_projections] Processing player ID: {player_id}")
 
                 # Fetch player info from cache
                 player_info = self.cache_manager.get_player(player_id)
                 if not self.is_player_info_complete(player_info or {}):
-                    logging.info(f"[process_projections] Player {player_id} has incomplete metadata. Deferring to fetch...")
+                    logging.info(f"[process_projections] Player {player_id} has incomplete metadata. Deferring...")
                     remaining_projections[player_id] = proj_data
                     continue
 
-                # Add player-level data if not already added
+                # Initialize player-level data
                 if player_id not in players_with_changes:
                     players_with_changes[player_id] = {
                         "name": player_info.get("name"),
@@ -75,7 +101,7 @@ class ProjectionProcessor:
                 top_level_opponent = None
                 consistent_top_level = True
 
-                # Process each projection for the player
+                # Process each projection
                 for proj_id, details in proj_data.items():
                     game_id = details.get("game_id")
                     game_info = game_mapping.get(game_id, {})
@@ -96,7 +122,7 @@ class ProjectionProcessor:
                             home_or_away = "away"
                             opponent = home_team
 
-                    # Check for consistency with top-level values
+                    # Check for consistency
                     if top_level_game_id is None:
                         top_level_game_id = game_id
                         top_level_home_or_away = home_or_away
@@ -113,58 +139,63 @@ class ProjectionProcessor:
                     details["opponent"] = opponent
                     players_with_changes[player_id]["projections"][proj_id] = details
 
-                # If consistent, move data to the top level and remove from projections
+                # Move consistent data to top level
                 if consistent_top_level:
                     player_changes = players_with_changes[player_id]
                     player_changes["game_id"] = top_level_game_id
                     player_changes["home_or_away"] = top_level_home_or_away
                     player_changes["opponent"] = top_level_opponent
 
-                    # Remove redundant data from projections
+                    # Remove redundant data
                     for proj_id, details in player_changes["projections"].items():
                         details.pop("home_or_away", None)
                         details.pop("opponent", None)
-                        details.pop("game_id",None)
+                        details.pop("game_id", None)
 
-            # Log one player's data for debugging
+            # Log summary of changes
             if players_with_changes:
-                first_player_id = next(iter(players_with_changes))  # Get the first player ID
-                first_player_data = players_with_changes[first_player_id]  # Get the corresponding data
-                logging.info(f"[process_projections] First player ID: {first_player_id}")
-                logging.info(f"[process_projections] First player data: {first_player_data}")
+                logging.info(f"[process_projections] Processed {len(players_with_changes)} players with changes.")
+                first_player_id = next(iter(players_with_changes))
+                logging.debug(f"[process_projections] Example player data: {players_with_changes[first_player_id]}")
 
-                # Pause execution to inspect the structure
-                logging.info("[process_projections] Pausing execution for debugging...")
-                
-                # Proceed with uploading to Firebase
-                logging.info(f"[process_projections] Uploading {len(players_with_changes)} changed players.")
+                # Upload changes to Firebase
                 self.firebase_manager.update_projections(players_with_changes, ref_path)
 
-            logging.info("[process_projections] Finished processing projections.")
+            logging.info("[process_projections] Projection processing complete.")
             return remaining_projections
 
         except Exception as e:
             logging.error(f"[process_projections] Exception occurred: {e}", exc_info=True)
             return {}
 
-    async def fetch_remaining_players(self, remaining_projections, ref_path: str):
+    async def fetch_remaining_players(self, remaining_projections: dict, ref_path: str) -> None:
+        """
+        Fetch missing player metadata and update Firebase with the retrieved data.
+
+        Args:
+            remaining_projections (dict): Projections for players with incomplete metadata.
+            ref_path (str): Firebase reference path for projections.
+        """
         logging.info("[fetch_remaining_players] Fetching missing player data...")
         players_with_changes = {}
 
         for player_id, proj_data in remaining_projections.items():
             try:
+                # Fetch player data from external API
                 raw_data = await self.data_fetcher.fetch_player_data(player_id)
                 logging.debug(f"[fetch_remaining_players] Raw data for {player_id}: {raw_data}")
 
                 player_data = raw_data.get("player_data") if isinstance(raw_data, dict) else None
 
                 if player_data and isinstance(player_data, dict):
+                    # Extract player metadata
                     name = player_data.get("name") or player_data.get("display_name")
                     position = player_data.get("position")
                     team = player_data.get("team")
                     league = player_data.get("league")
                     image_url = player_data.get("image_url") or "__missing__"
 
+                    # Merge player data with projections
                     merged_player_data = {
                         "name": name,
                         "position": position,
@@ -176,6 +207,7 @@ class ProjectionProcessor:
 
                     players_with_changes[player_id] = merged_player_data
 
+                    # Prepare filtered player info for Firebase
                     filtered_player_info = {
                         "name": name,
                         "position": position,
@@ -184,7 +216,7 @@ class ProjectionProcessor:
                         "image_url": image_url
                     }
 
-                    logging.info(f"[update_player] Data for {player_id} => {filtered_player_info}")
+                    logging.info(f"[fetch_remaining_players] Updating player {player_id} in Firebase.")
                     self.firebase_manager.update_player(player_id, filtered_player_info)
 
                 else:
@@ -197,13 +229,21 @@ class ProjectionProcessor:
             logging.info(f"[fetch_remaining_players] Uploading {len(players_with_changes)} players to Firebase projections ref.")
             self.firebase_manager.update_projections(players_with_changes, ref_path)
 
-    async def remove_outdated_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str):
+    async def remove_outdated_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str) -> None:
+        """
+        Remove outdated projections and player nodes from Firebase.
+
+        Args:
+            current_projection_map (Dict[str, Set[str]]): Map of current projections by player ID.
+            ref_path (str): Firebase reference path for projections.
+        """
         logging.info("[remove_outdated_projections] Checking for outdated projections...")
         projections_to_remove = []
         players_to_remove_entirely = []
         league = self.firebase_manager._extract_league_from_ref(ref_path)
 
         try:
+            # Retrieve cached player projections
             cached_players = self.cache_manager.get_all_player_projections_by_league(league)
 
             for player_id, cached_data in cached_players.items():
@@ -243,9 +283,17 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[remove_outdated_projections] Error: {e}")
 
+    def filter_relevant_projections(self, projections: list, ref_path: str) -> dict:
+        """
+        Filter projections to identify new, changed, or relevant projections.
 
+        Args:
+            projections (list): List of projections from the external API.
+            ref_path (str): Firebase reference path for projections.
 
-    def filter_relevant_projections(self, projections, ref_path: str):
+        Returns:
+            dict: Filtered projections grouped by player ID.
+        """
         logging.info("[filter_relevant_projections] Filtering projections...")
         filtered_projections = {}
         active_projection_map: Dict[str, Set[str]] = defaultdict(set)
@@ -310,8 +358,17 @@ class ProjectionProcessor:
             logging.error(f"[filter_relevant_projections] Error: {e}")
             return {}
 
+    def detect_field_changes(self, projection: dict, cached_projection: dict) -> Optional[dict]:
+        """
+        Detect changes in projection fields compared to cached data.
 
-    def detect_field_changes(self, projection, cached_projection):
+        Args:
+            projection (dict): Current projection data.
+            cached_projection (dict): Cached projection data.
+
+        Returns:
+            Optional[dict]: Dictionary of changed fields, or None if no changes.
+        """
         changed_fields = {}
         try:
             for field in ["line_score", "start_time", "status"]:

@@ -4,18 +4,34 @@ import time
 from managers.firebase_manager import FirebaseManager
 from managers.cache_manager import CacheManager
 
+
 class RealtimeListener:
+    """
+    Listens to Firebase Realtime Database updates and manages cache synchronization.
+    """
+
     def __init__(self, firebase_manager: FirebaseManager, cache_manager: CacheManager, platform_abbr: str):
+        """
+        Initialize the RealtimeListener.
+
+        Args:
+            firebase_manager (FirebaseManager): Manages Firebase interactions.
+            cache_manager (CacheManager): Handles Redis caching.
+            platform_abbr (str): Abbreviation for the platform (e.g., "pp" for PrizePicks).
+        """
         self.firebase_manager = firebase_manager
         self.cache_manager = cache_manager
         self.platform_abbr = platform_abbr.lower()
         self.listener_running = True
         self.initial_sync_complete = threading.Event()
 
-    def warm_up_projections_from_firebase(self, ref_path: str):
+    def warm_up_projections_from_firebase(self, ref_path: str) -> None:
         """
         Pull all projection-related data (including player metadata) from Firebase
-        and warm up the projection cache with full player records.
+        and populate the projection cache with full player records.
+
+        Args:
+            ref_path (str): Firebase reference path for projections.
         """
         try:
             logging.info(f"[warm_up_projections_from_firebase] Warming cache from Firebase ref: {ref_path}")
@@ -27,25 +43,29 @@ class RealtimeListener:
 
             league = self.firebase_manager._extract_league_from_ref(ref_path)
 
+            # Cache projections in bulk
             count = self.cache_manager.set_projection_bulk(
                 projections_by_player=projections_snapshot,
                 league=league
             )
-
             logging.info(f"[warm_up_projections_from_firebase] Cached {count} full player entries from '{ref_path}'.")
 
+            # Log a sample cached entry for debugging
             for player_id in projections_snapshot:
                 sample_key = f"{self.platform_abbr}:projections:{league}:{400000000}"
                 raw = self.cache_manager.get(sample_key)
-                logging.info(f"[Sample Cached Entry] {sample_key} = {raw}")
+                logging.debug(f"[Sample Cached Entry] {sample_key} = {raw}")
                 break
 
         except Exception as e:
             logging.error(f"[warm_up_projections_from_firebase] Error warming projection cache: {e}")
-            
-    def cleanup_projections_by_league(self, ref_path: str):
+
+    def cleanup_projections_by_league(self, ref_path: str) -> None:
         """
         Clear the projection cache and wipe Firebase data for a given league reference.
+
+        Args:
+            ref_path (str): Firebase reference path for projections.
         """
         try:
             logging.info(f"[cleanup_projections_by_league] Cleaning cache and Firebase data for ref: {ref_path}")
@@ -54,36 +74,33 @@ class RealtimeListener:
 
             # Clear cache
             cleared_count = self.cache_manager.clear_projections_for_league(league)
-
             logging.info(f"[cleanup_projections_by_league] Cleared {cleared_count} cached projections for league '{league}'.")
 
             # Delete from Firebase
             self.firebase_manager.set_projections(ref_path, None)
-
             logging.info(f"[cleanup_projections_by_league] Firebase projections cleared at '{ref_path}'.")
 
         except Exception as e:
             logging.error(f"[cleanup_projections_by_league] Error during cleanup: {e}")
 
-        
-
-    def warm_up_players_from_firebase(self):
+    def warm_up_players_from_firebase(self) -> None:
         """
-        Pull all players from Firebase and populate in-memory cache.
-        Always runs on start since cache is not persistent.
+        Pull all players from Firebase and populate the in-memory cache.
+        Always runs on start since the cache is not persistent.
         """
         try:
             logging.info("Warming in-memory cache with player data from Firebase.")
             start_time = time.time()
 
             snapshot = self.firebase_manager.player_ref.get()
-            logging.info(f"Snapshot type: {type(snapshot)}")
+            logging.debug(f"Snapshot type: {type(snapshot)}")
 
             if not snapshot:
                 logging.warning("No player data found in Firebase.")
                 self.initial_sync_complete.set()
                 return
 
+            # Cache players in bulk
             if isinstance(snapshot, list):
                 players_dict = {
                     (player.get("player_id") or str(idx)): player
@@ -105,11 +122,17 @@ class RealtimeListener:
         finally:
             self.initial_sync_complete.set()
 
-    def start(self):
+    def start(self) -> None:
         """
-        Start the Firebase Realtime Database listener.
+        Start the Firebase Realtime Database listener to monitor player updates.
         """
-        def update_cache(event):
+        def update_cache(event) -> None:
+            """
+            Handle updates from Firebase and synchronize the cache.
+
+            Args:
+                event: Firebase event containing the updated data.
+            """
             if not self.listener_running:
                 logging.info("Listener stopped.")
                 return
@@ -139,6 +162,7 @@ class RealtimeListener:
 
             self.cache_manager.set_player(player_id, updated_data)
 
+        # Start the listener in a separate thread
         threading.Thread(
             target=lambda: self.firebase_manager.player_ref.listen(update_cache),
             daemon=True
