@@ -92,7 +92,8 @@ class ProjectionProcessor:
                         "game_id": None,
                         "home_or_away": None,
                         "opponent": None,
-                        "projections": {}
+                        "projections": {},
+                        "inconsistent_projections": False  # Add flag for inconsistent projections
                     }
 
                 # Track top-level consistency
@@ -151,6 +152,9 @@ class ProjectionProcessor:
                         details.pop("home_or_away", None)
                         details.pop("opponent", None)
                         details.pop("game_id", None)
+                else:
+                    # Mark the player as having inconsistent projections
+                    players_with_changes[player_id]["inconsistent_projections"] = True
 
             # Log summary of changes
             if players_with_changes:
@@ -170,64 +174,48 @@ class ProjectionProcessor:
 
     async def fetch_remaining_players(self, remaining_projections: dict, ref_path: str) -> None:
         """
-        Fetch missing player metadata and update Firebase with the retrieved data.
+        Fetch missing player metadata, upload it to Firebase and cache, and reprocess projections.
 
         Args:
             remaining_projections (dict): Projections for players with incomplete metadata.
             ref_path (str): Firebase reference path for projections.
         """
         logging.info("[fetch_remaining_players] Fetching missing player data...")
-        players_with_changes = {}
 
-        for player_id, proj_data in remaining_projections.items():
-            try:
-                # Fetch player data from external API
-                raw_data = await self.data_fetcher.fetch_player_data(player_id)
-                logging.debug(f"[fetch_remaining_players] Raw data for {player_id}: {raw_data}")
+        try:
+            for player_id, proj_data in remaining_projections.items():
+                try:
+                    # Fetch player data from external API
+                    raw_data = await self.data_fetcher.fetch_player_data(player_id)
+                    logging.debug(f"[fetch_remaining_players] Raw data for {player_id}: {raw_data}")
 
-                player_data = raw_data.get("player_data") if isinstance(raw_data, dict) else None
+                    player_data = raw_data.get("player_data") if isinstance(raw_data, dict) else None
 
-                if player_data and isinstance(player_data, dict):
-                    # Extract player metadata
-                    name = player_data.get("name") or player_data.get("display_name")
-                    position = player_data.get("position")
-                    team = player_data.get("team")
-                    league = player_data.get("league")
-                    image_url = player_data.get("image_url") or "__missing__"
+                    if player_data and isinstance(player_data, dict):
+                        # Prepare player metadata
+                        player_metadata = {
+                            "name": player_data.get("name") or player_data.get("display_name"),
+                            "position": player_data.get("position"),
+                            "team": player_data.get("team"),
+                            "league": player_data.get("league"),
+                            "image_url": player_data.get("image_url") or "__missing__",
+                        }
 
-                    # Merge player data with projections
-                    merged_player_data = {
-                        "name": name,
-                        "position": position,
-                        "team": team,
-                        "league": league,
-                        "image_url": image_url,
-                        "projections": proj_data
-                    }
+                        # Upload player metadata to Firebase and cache
+                        self.firebase_manager.update_player(player_id, player_metadata)
+                        self.cache_manager.set_player(player_id, player_metadata)
+                    else:
+                        logging.warning(f"[fetch_remaining_players] No valid player_data found for {player_id}")
 
-                    players_with_changes[player_id] = merged_player_data
+                except Exception as e:
+                    logging.error(f"[fetch_remaining_players] Error fetching player {player_id}: {e}")
 
-                    # Prepare filtered player info for Firebase
-                    filtered_player_info = {
-                        "name": name,
-                        "position": position,
-                        "team": team,
-                        "league": league,
-                        "image_url": image_url
-                    }
+            # After fetching metadata, reprocess projections
+            logging.info("[fetch_remaining_players] All missing metadata fetched. Reprocessing projections...")
+            await self.process_projections(remaining_projections, ref_path)
 
-                    logging.info(f"[fetch_remaining_players] Updating player {player_id} in Firebase.")
-                    self.firebase_manager.update_player(player_id, filtered_player_info)
-
-                else:
-                    logging.warning(f"[fetch_remaining_players] No valid player_data found for {player_id}")
-
-            except Exception as e:
-                logging.error(f"[fetch_remaining_players] Error fetching player {player_id}: {e}")
-
-        if players_with_changes:
-            logging.info(f"[fetch_remaining_players] Uploading {len(players_with_changes)} players to Firebase projections ref.")
-            self.firebase_manager.update_projections(players_with_changes, ref_path)
+        except Exception as e:
+            logging.error(f"[fetch_remaining_players] Exception occurred: {e}", exc_info=True)
 
     async def remove_outdated_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str) -> None:
         """
