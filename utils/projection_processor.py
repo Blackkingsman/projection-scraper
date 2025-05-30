@@ -92,6 +92,7 @@ class ProjectionProcessor:
                         "game_id": None,
                         "home_or_away": None,
                         "opponent": None,
+                        "start_time": None,
                         "projections": {},
                         "inconsistent_projections": False  # Add flag for inconsistent projections
                     }
@@ -107,6 +108,7 @@ class ProjectionProcessor:
                     game_id = details.get("game_id")
                     game_info = game_mapping.get(game_id, {})
                     team_abbr = player_info.get("team")
+                    start_time = details.get("start_time")
                     home_or_away = "unknown"
                     opponent = "unknown"
 
@@ -128,6 +130,7 @@ class ProjectionProcessor:
                         top_level_game_id = game_id
                         top_level_home_or_away = home_or_away
                         top_level_opponent = opponent
+                        top_level_start_time = start_time
                     elif (
                         game_id != top_level_game_id
                         or home_or_away != top_level_home_or_away
@@ -138,6 +141,7 @@ class ProjectionProcessor:
                     # Add projection-level data
                     details["home_or_away"] = home_or_away
                     details["opponent"] = opponent
+                    details["start_time"] = start_time
                     players_with_changes[player_id]["projections"][proj_id] = details
 
                 # Move consistent data to top level
@@ -146,12 +150,14 @@ class ProjectionProcessor:
                     player_changes["game_id"] = top_level_game_id
                     player_changes["home_or_away"] = top_level_home_or_away
                     player_changes["opponent"] = top_level_opponent
+                    player_changes["start_time"] = top_level_start_time
 
                     # Remove redundant data
                     for proj_id, details in player_changes["projections"].items():
                         details.pop("home_or_away", None)
                         details.pop("opponent", None)
                         details.pop("game_id", None)
+                        details.pop("start_time", None)
                 else:
                     # Mark the player as having inconsistent projections
                     players_with_changes[player_id]["inconsistent_projections"] = True
@@ -359,13 +365,23 @@ class ProjectionProcessor:
         """
         changed_fields = {}
         try:
-            for field in ["line_score", "start_time", "status"]:
+            for field in ["line_score", "stat_type", "status"]:
                 if projection[field] != cached_projection.get(field):
                     logging.info(f"[detect_field_changes] Field '{field}' changed: {cached_projection.get(field)} → {projection[field]}")
                     changed_fields[field] = {
                         "old": cached_projection.get(field),
                         "new": projection[field]
                     }
+
+            # Check start_time only if it exists in both projection and cached_projection
+            if "start_time" in projection and "start_time" in cached_projection:
+                if projection["start_time"] != cached_projection["start_time"]:
+                    logging.info(f"[detect_field_changes] Field 'start_time' changed: {cached_projection['start_time']} → {projection['start_time']}")
+                    changed_fields["start_time"] = {
+                        "old": cached_projection["start_time"],
+                        "new": projection["start_time"]
+                    }
+
         except Exception as e:
             logging.error(f"[detect_field_changes] Error comparing fields: {e}")
         return changed_fields if changed_fields else None
