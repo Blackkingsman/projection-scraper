@@ -28,6 +28,9 @@ class FirestoreManager:
         """
         collection_ref = self.db.collection('PrizePicksSportsFlag')
 
+        # Fetch the list of sports in the PrizePicksSportsFlag collection
+        valid_sports = {doc.id for doc in collection_ref.stream()}
+
         # Define the Firestore snapshot listener
         def on_snapshot(col_snapshot, changes, read_time):
             """
@@ -40,6 +43,10 @@ class FirestoreManager:
             """
             for change in changes:
                 sport_name = change.document.id
+                if sport_name not in valid_sports:
+                    logging.info(f"[FirestoreManager] Ignoring update for irrelevant sport: {sport_name}")
+                    continue
+
                 data = change.document.to_dict()
                 active = data.get('active', False)
                 league_id = data.get('id')
@@ -62,3 +69,56 @@ class FirestoreManager:
             logging.info("[FirestoreManager] Firestore listener stopped.")
         else:
             logging.warning("[FirestoreManager] No active Firestore listener to stop.")
+
+    def update_league_flag(self, league_id: int, active: bool):
+        """
+        Update the active flag for a league in Firestore.
+
+        Args:
+            league_id (int): The ID of the league.
+            active (bool): The active status to set.
+        """
+        try:
+            league_ref = self.db.collection("PrizePicksSportsFlag").document(str(league_id))
+            league_ref.update({"active": active})
+            logging.info(f"[FirestoreManager] Updated league {league_id} active flag to {active}.")
+        except Exception as e:
+            logging.error(f"[FirestoreManager] Failed to update league {league_id} active flag: {e}")
+
+    def get_league_id(self, sport_name: str) -> str:
+        """
+        Fetch the league ID for a given sport from Firestore.
+
+        Args:
+            sport_name (str): The name of the sport.
+
+        Returns:
+            str: The league ID associated with the sport.
+        """
+        try:
+            sport_ref = self.db.collection("PrizePicksSportsFlag").document(sport_name)
+            sport_data = sport_ref.get().to_dict()
+            if sport_data and "id" in sport_data:
+                return sport_data["id"]
+            else:
+                logging.warning(f"[FirestoreManager] No league ID found for sport: {sport_name}")
+                return None
+        except Exception as e:
+            logging.error(f"[FirestoreManager] Error fetching league ID for sport {sport_name}: {e}")
+            return None
+
+    def get_projection_ref(self, league_id: str):
+        """
+        Fetch the projection reference for a given league ID from Firestore.
+
+        Args:
+            league_id (str): The ID of the league.
+
+        Returns:
+            Firestore Document Reference: The reference to the projection document.
+        """
+        try:
+            return self.db.collection("Projections").document(league_id)
+        except Exception as e:
+            logging.error(f"[FirestoreManager] Error fetching projection reference for league ID {league_id}: {e}")
+            return None

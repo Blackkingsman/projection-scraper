@@ -14,6 +14,7 @@ from utils.data_fetcher import DataFetcher  # Fetches data from external APIs
 from utils.projection_processor import ProjectionProcessor  # Processes projections
 from utils.signal_handler import SignalHandler  # Handles OS signals for graceful shutdown
 from utils.realtime_listener import RealtimeListener  # Listens to Firebase Realtime Database
+from managers.league_activity_manager import LeagueActivityManager
 
 # ------------------- Command-Line Arguments -------------------
 
@@ -107,9 +108,12 @@ realtime_listener = RealtimeListener(firebase_manager, cache_manager, config["ab
 # Dictionary to track active monitoring tasks
 sport_tasks = {}
 
+# Shared dictionary to track sports signaling shutdown
+shutdown_signals = {}
+
 # ------------------- Dispatcher Callback -------------------
 
-def dispatcher_callback(sport_name: str, active: bool, league_id: str, loop: asyncio.AbstractEventLoop) -> None:
+def dispatcher_callback(sport_name: str, active: bool, league_id: str, loop: asyncio.AbstractEventLoop, league_activity_manager: LeagueActivityManager) -> None:
     """
     Callback function triggered by Firestore updates to start or stop monitoring tasks.
 
@@ -118,6 +122,7 @@ def dispatcher_callback(sport_name: str, active: bool, league_id: str, loop: asy
         active (bool): Whether the sport is active or not.
         league_id (str): League ID for the sport.
         loop (asyncio.AbstractEventLoop): The asyncio event loop.
+        league_activity_manager (LeagueActivityManager): Manager for league activity.
     """
     logging.info(f"Dispatcher received update: {sport_name} (League ID: {league_id}) is now {'active' if active else 'inactive'}.")
 
@@ -131,23 +136,33 @@ def dispatcher_callback(sport_name: str, active: bool, league_id: str, loop: asy
     projection_ref = projection_config["ref"]
 
     if active:
-        # Start monitoring task if not already running
+        firestore_manager.update_league_flag(sport_name, active=True)
+        logging.info(f"[{sport_name}] Firestore flag set to active.")
+
         if sport_name not in sport_tasks or sport_tasks[sport_name].done():
             logging.info(f"Starting monitoring task for {sport_name}.")
-            future = asyncio.run_coroutine_threadsafe(monitor_sport(sport_name, league_id, projection_ref), loop)
+            process_complete_event = threading.Event()
+            future = asyncio.run_coroutine_threadsafe(
+                monitor_sport(sport_name, league_id, projection_ref, process_complete_event, league_activity_manager), loop
+            )
             sport_tasks[sport_name] = future
         else:
             logging.info(f"Monitoring task for {sport_name} is already running.")
     else:
-        # Stop monitoring task if active
         future = sport_tasks.get(sport_name)
         if future and not future.done():
             logging.info(f"Stopping monitoring task for {sport_name}.")
             future.cancel()
+            try:
+                # Block until the monitoring task fully stops
+                future.result()
+                logging.info(f"Monitoring task for {sport_name} stopped successfully.")
+            except asyncio.CancelledError:
+                logging.error(f"Error stopping monitoring task for {sport_name}.")
 
 # ------------------- Monitoring Coroutine -------------------
 
-async def monitor_sport(sport_name: str, league_id: str, projection_ref: str) -> None:
+async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, process_complete_event: threading.Event, league_activity_manager: LeagueActivityManager) -> None:
     """
     Coroutine to monitor projections for a specific sport.
 
@@ -155,27 +170,33 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str) ->
         sport_name (str): Name of the sport (e.g., NBA, NFL).
         league_id (str): League ID for the sport.
         projection_ref (str): Firebase reference for projections.
+        process_complete_event (threading.Event): Event to signal shutdown.
+        league_activity_manager (LeagueActivityManager): Manager for league activity.
     """
     logging.info(f"🟢 Monitor for {sport_name} started with League ID {league_id}.")
     realtime_listener.warm_up_projections_from_firebase(projection_ref)
 
     try:
-        while not shutdown_event.is_set():
+        # Continue monitoring until global shutdown or this sport signals complete
+        while not shutdown_event.is_set() and not process_complete_event.is_set():
             try:
-                # Fetch projections from the external API
-                projections = await data_fetcher.fetch_projections(league_id, selected_platform.value.lower())
+                result = await data_fetcher.fetch_projections(league_id, selected_platform.value.lower())
+                status_code = result.get("status_code")
+                projections = result.get("projections")
+
+                if not isinstance(projections, list):
+                    logging.error(f"[{sport_name}] Invalid projections format: {type(projections)}")
+                    projections = []
             except Exception as e:
                 logging.error(f"[{sport_name}] ❌ Error fetching projections: {e}")
-                projections = None
+                status_code, projections = None, None
 
             if projections:
                 logging.info(f"[{sport_name}] Retrieved {len(projections)} projections.")
-                # Filter relevant projections
                 filtered_projections = projection_processor.filter_relevant_projections(projections, projection_ref)
-                if filtered_projections:
+                if isinstance(filtered_projections, dict) and filtered_projections:
                     logging.info(f"[{sport_name}] 📊 Processing {len(filtered_projections)} projections.")
                     try:
-                        # Process projections and fetch remaining data if needed
                         remaining_projections = await projection_processor.process_projections(filtered_projections, projection_ref)
                     except Exception as e:
                         logging.error(f"[{sport_name}] ❌ Error in process_projections: {e}")
@@ -188,8 +209,24 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str) ->
                         logging.info(f"[{sport_name}] ✅ No additional projections to fetch.")
                 else:
                     logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
+            elif status_code == 200 and len(projections) == 0:
+                if projection_ref:
+                    logging.info(f"[{sport_name}] Storing historical projections and removing outdated ones.")
+                    historical_ref_path = f"{projection_ref}Historicals"
+
+                    cached_players = cache_manager.get_all_player_projections_by_league(projection_processor.firebase_manager._extract_league_from_ref(projection_ref))
+
+                    if cached_players:
+                        await projection_processor.store_historical_projections({}, projection_ref, historical_ref_path)
+                        await projection_processor.remove_outdated_projections({}, projection_ref)
+                    else:
+                        logging.info(f"[{sport_name}] No cached data found. Signaling shutdown.")
+                        process_complete_event.set()
+                        shutdown_signals[sport_name] = True
+                        # Break loop after signaling shutdown
+                        break
             else:
-                logging.warning(f"[{sport_name}] ⚠️ No projections fetched or error occurred.")
+                logging.info(f"[{sport_name}] Continuing monitoring as projections are still available.")
 
             await asyncio.sleep(random.randint(30, 45))
 
@@ -200,6 +237,15 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str) ->
         raise
     finally:
         logging.info(f"🔚 {sport_name} monitoring task has stopped.")
+
+        if process_complete_event.is_set():
+            # One-off check of projections count for this league
+            projections_count = await league_activity_manager.get_projections_count_for_league(league_id)
+            if projections_count == 0:
+                logging.info(f"No projections for {sport_name}. Triggering update.")
+                # Update Firestore flag to inactive
+                firestore_manager.update_league_flag(sport_name, active=False)
+                logging.info(f"[{sport_name}] Shutdown complete. Firestore flag updated.")
 
 # ------------------- Main Loop -------------------
 
@@ -222,29 +268,56 @@ async def main_async_loop() -> None:
     realtime_listener.initial_sync_complete.wait()
     logging.info("Initial Redis cache loaded.")
 
-    # Listen for Firestore updates and dispatch tasks
     firestore_manager.listen_sports_flags(
         lambda sport_name, active, league_id: dispatcher_callback(
-            sport_name, active, league_id, loop
+            sport_name, active, league_id, loop, league_activity_manager
         )
     )
 
+    league_activity_manager = LeagueActivityManager(config["abbr"], firestore_manager)
+
+    stopped_processes = set()
+
     while not shutdown_event.is_set():
-        if not sport_tasks or all(future.done() for future in sport_tasks.values()):
-            logging.info("No sports currently being monitored.")
+        for sport_name in list(sport_tasks.keys()):
+            future = sport_tasks[sport_name]
+            if future.done():
+                stopped_processes.add(sport_name)
+
+        for sport_name in stopped_processes:
+            # Check league activity to decide on restart or shutdown
+            league_id = firestore_manager.get_league_id(sport_name)
+            # Fetch current projections count for this league
+            projections_count = await league_activity_manager.get_projections_count_for_league(league_id)
+            if projections_count > 0:
+                logging.info(f"Projections still active for {sport_name} (count={projections_count}), restarting monitoring task.")
+                # Restart monitoring task
+                process_complete_event = threading.Event()
+                future = asyncio.run_coroutine_threadsafe(
+                    monitor_sport(sport_name, league_id, config["projections"][int(league_id)]["ref"], process_complete_event, league_activity_manager), loop
+                )
+                sport_tasks[sport_name] = future
+                # Clear any previous shutdown signal
+                shutdown_signals.pop(sport_name, None)
+            else:
+                logging.info(f"No projections for {sport_name}. Triggering shutdown update.")
+                firestore_manager.update_league_flag(sport_name, active=False)
+                logging.info(f"[{sport_name}] Shutdown complete. Firestore flag updated.")
+         
+        stopped_processes.clear()
+
         await asyncio.sleep(10)
 
     logging.info("Main loop received shutdown signal, cleaning up...")
     firestore_manager.stop_listener()
 
-    for sport, future in sport_tasks.items():
-        if not future.done():
-            logging.info(f"Cancelling monitoring task for {sport}.")
-            future.cancel()
-            try:
-                await asyncio.wrap_future(future)
-            except asyncio.CancelledError:
-                logging.info(f"{sport} monitoring task cancelled successfully.")
+    try:
+        await asyncio.gather(
+            *(asyncio.wrap_future(future) for future in sport_tasks.values() if not future.done()),
+            return_exceptions=True
+        )
+    except Exception as e:
+        logging.error(f"Error during task cleanup: {e}")
 
     logging.info("All monitoring tasks cleaned up.")
 

@@ -38,7 +38,7 @@ class DataFetcher:
             'x-api-key': self.XAPI_KEY,
         }
 
-    async def fetch_projections(self, league_id: int, platform: str) -> List[Dict[str, Any]]:
+    async def fetch_projections(self, league_id: int, platform: str) -> Dict[str, Any]:
         """
         Fetch projections for a specific league and platform.
 
@@ -47,7 +47,7 @@ class DataFetcher:
             platform (str): Platform name (e.g., "prizepicks", "underdog").
 
         Returns:
-            List[Dict[str, Any]]: List of projections.
+            Dict[str, Any]: Contains projections and HTTP status code.
         """
         try:
             if platform == "prizepicks":
@@ -58,9 +58,9 @@ class DataFetcher:
                 raise ValueError(f"[fetch_projections] Unsupported platform '{platform}'.")
         except Exception as e:
             logging.error(f"[fetch_projections] Error fetching projections: {e}")
-            return []
+            return {"projections": [], "status_code": None}
 
-    async def fetch_prizepicks_projections(self, league_id: int) -> List[Dict[str, Any]]:
+    async def fetch_prizepicks_projections(self, league_id: int) -> Dict[str, Any]:
         """
         Fetch projections from the PrizePicks API.
 
@@ -68,30 +68,32 @@ class DataFetcher:
             league_id (int): League ID for the projections.
 
         Returns:
-            List[Dict[str, Any]]: List of projections.
+            Dict[str, Any]: Contains projections and HTTP status code.
         """
         endpoint = f"{self.BASE_URL}/fetch-prizepicks"
         try:
             logging.info(f"[fetch_prizepicks_projections] Requesting league_id: {league_id}")
 
-            # Explicitly set timeout to 10 seconds
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(endpoint, headers=self.headers, json={"league_id": league_id})
 
             response.raise_for_status()
             data = response.json().get('projections', [])
+            status_code = response.status_code
+
             if data:
                 logging.info(f"[fetch_prizepicks_projections] Retrieved {len(data)} projections.")
             else:
                 logging.warning("[fetch_prizepicks_projections] No projections found.")
-            return data
+
+            return {"projections": data, "status_code": status_code}
 
         except httpx.HTTPError as e:
             logging.error(f"[fetch_prizepicks_projections] HTTP error: {e}")
-            return []
+            return {"projections": [], "status_code": None}
         except Exception as e:
             logging.error(f"[fetch_prizepicks_projections] Exception: {e}")
-            return []
+            return {"projections": [], "status_code": None}
 
     async def fetch_underdog_projections(self, league_id: int) -> List[Dict[str, Any]]:
         """

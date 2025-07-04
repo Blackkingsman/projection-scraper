@@ -3,6 +3,7 @@ import time
 import asyncio
 from typing import Dict, Set, Optional
 from collections import defaultdict
+import datetime
 from managers.firebase_manager import FirebaseManager
 from managers.cache_manager import CacheManager
 from utils.data_fetcher import DataFetcher
@@ -277,6 +278,69 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[remove_outdated_projections] Error: {e}")
 
+    async def store_historical_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str, historical_ref_path: str, changed_map: Optional[Dict[str, Dict]] = None) -> None:
+        """
+        Store historical projections in Firebase under a timestamp-based structure.
+
+        Args:
+            current_projection_map: Map of current projections by player ID.
+            ref_path: Firebase reference path for current projections.
+            historical_ref_path: Firebase reference path for historical projections.
+        """
+        logging.info("[store_historical_projections] Storing historical projections...")
+        try:
+            changed_map = changed_map or {}
+            historical_data = {}
+            league = self.firebase_manager._extract_league_from_ref(ref_path)
+            cached_players = self.cache_manager.get_all_player_projections_by_league(league)
+            for player_id, cached_data in cached_players.items():
+                proj_data = cached_data.get("projections", {})
+                current_ids = current_projection_map.get(player_id)
+                # Case 1: player gone completely
+                if not current_ids:
+                    logging.info(f"[store_historical_projections] Player {player_id} gone → archiving full node")
+                    historical_data[player_id] = cached_data
+                    continue
+                # Case 2: some projections removed/changed
+            # projections to archive: removed or changed
+            removed = {pid for pid in proj_data if pid not in current_ids}
+            changed_pids = set(changed_map.get(player_id, {}).keys())
+            target_ids = removed.union(changed_pids)
+            if target_ids:
+                to_archive = {}
+                for pid in target_ids:
+                    p = proj_data.get(pid)
+                    if not p:
+                        continue
+                    # determine changes dict
+                    if pid in changed_pids:
+                        entry = changed_map[player_id][pid]
+                        changes = entry.get('changed_fields', {})
+                        history = entry.get('line_score_history')
+                    else:
+                        changes = self.detect_field_changes(p, p)
+                        history = None
+                    # build archive entry
+                    archive_entry = {**p, 'changed_fields': changes}
+                    if history is not None:
+                        logging.info(f"[store_historical_projections] Appending line_score_history for player {player_id}, projection {pid}: {history}")
+                        archive_entry['line_score_history'] = history
+                    to_archive[pid] = archive_entry
+            if not historical_data:
+                logging.info("[store_historical_projections] No historical data to write.")
+                return
+            # pick date key
+            first = next(iter(historical_data.values()))
+            ts = first.get('start_time') or next((p.get('date_key') for p in first['projections'].values() if p.get('date_key')), None)
+            parsed = datetime.datetime.fromisoformat(ts)
+            readable_date = parsed.strftime("%d%b%Y").upper()
+            # archive
+            hist_ref = self.firebase_manager._get_projection_ref(historical_ref_path)
+            hist_ref.child(readable_date).update(historical_data)
+            logging.info(f"[store_historical_projections] Archived under '{readable_date}' → {len(historical_data)} players.")
+        except Exception as e:
+            logging.error(f"[store_historical_projections] Failed: {e}", exc_info=True)
+
     def filter_relevant_projections(self, projections: list, ref_path: str) -> dict:
         """
         Filter projections to identify new, changed, or relevant projections.
@@ -297,6 +361,10 @@ class ProjectionProcessor:
         new_proj_set = set()
 
         try:
+            logging.debug(f"[filter_relevant_projections] Projections type: {type(projections)}, Ref path type: {type(ref_path)}")
+            logging.debug(f"[filter_relevant_projections] Projections content: {projections}")
+            logging.debug(f"[filter_relevant_projections] Ref path content: {ref_path}")
+
             league = self.firebase_manager._extract_league_from_ref(ref_path)
 
             for proj in projections:
@@ -308,6 +376,14 @@ class ProjectionProcessor:
                 stat_type = proj['attributes']['stat_type']
                 status = proj['attributes']['status']
                 game_id = proj['attributes'].get('game_id')  # Add game_id here
+
+                # Extract date from start_time
+                try:
+                    parsed_time = datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S%z")
+                    date_key = parsed_time.strftime("%Y-%m-%d")
+                except ValueError as ve:
+                    logging.error(f"[filter_relevant_projections] Invalid start_time format for projection {projection_id}: {start_time}. Error: {ve}")
+                    continue
 
                 active_projection_map[player_id].add(projection_id)
 
@@ -321,30 +397,65 @@ class ProjectionProcessor:
                     filtered_projections.setdefault(player_id, {})[projection_id] = {
                         "line_score": line_score,
                         "stat_type": stat_type,
-                        "start_time": start_time,
                         "status": status,
-                        "game_id": game_id  # Include game_id in the projection data
+                        "game_id": game_id,  # Include game_id in the projection data
+                        "date_key": date_key  # Include extracted date
                     }
                 else:
                     changed_fields = self.detect_field_changes(proj['attributes'], cached_projection)
                     if changed_fields:
+                        logging.info(f"[filter_relevant_projections] Detected field changes for player {player_id}, projection {projection_id}: {changed_fields}")
                         changed_proj_set.add(player_id)
+                        # Build history for line_score if changed
+                        history = None
+                        if 'line_score' in changed_fields:
+                            history = [changed_fields['line_score']['old'], changed_fields['line_score']['new']]
                         filtered_projections.setdefault(player_id, {})[projection_id] = {
                             "line_score": line_score,
                             "stat_type": stat_type,
-                            "start_time": start_time,
                             "status": status,
                             "game_id": game_id,  # Include game_id in the projection data
-                            "changed_fields": changed_fields
+                            "changed_fields": changed_fields,
+                            "date_key": date_key,  # Include extracted date
+                            # Include optional history list
+                            "line_score_history": history if history is not None else cached_projection.get('line_score_history')
                         }
 
             logging.info(
                 f"[filter_relevant_projections] New: {len(new_proj_set)}, Changed: {len(changed_proj_set)}"
             )
 
-            asyncio.create_task(
-                self.remove_outdated_projections(active_projection_map, ref_path)
-            )
+            # Archive historical projections and remove outdated when changes detected
+            historical_ref_path = f"{ref_path}Historicals"
+            # Build map of only changed entries for history
+            changed_map: Dict[str, Dict[str, dict]] = {}
+            for pid, proj_dict in filtered_projections.items():
+                changes = {
+                    proj_id: entry
+                    for proj_id, entry in proj_dict.items()
+                    if entry.get("changed_fields")
+                }
+                if changes:
+                    changed_map[pid] = changes
+
+            # Only archive & remove when there are actual changes
+            if changed_map:
+                # Archive historicals (handles removed entries too)
+                asyncio.create_task(
+                    self.store_historical_projections(
+                        active_projection_map,
+                        ref_path,
+                        historical_ref_path,
+                        changed_map
+                    )
+                )
+                # Remove outdated projections
+                asyncio.create_task(
+                    self.remove_outdated_projections(
+                        active_projection_map,
+                        ref_path
+                    )
+                )
 
             return filtered_projections
 
