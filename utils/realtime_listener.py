@@ -144,6 +144,13 @@ class RealtimeListener:
                 logging.info("Initial sync from Firebase complete.")
                 if isinstance(updated_data, dict):
                     self.cache_manager.bulk_set_players(updated_data)
+                elif isinstance(updated_data, list):
+                    logging.warning("Unexpected format for root-level data: list. Attempting to process as a list.")
+                    players_dict = {
+                        (player.get("player_id") or str(idx)): player
+                        for idx, player in enumerate(updated_data) if player
+                    }
+                    self.cache_manager.bulk_set_players(players_dict)
                 elif updated_data is None:
                     logging.info("Initial sync received, but no data available.")
                 else:
