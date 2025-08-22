@@ -10,12 +10,46 @@ import random
 load_dotenv(dotenv_path="./config/.env")
 
 class LeagueActivityManager:
-    def __init__(self, base_url: str, firestore_manager):
+    def set_ready(self):
+        """
+        Mark the LeagueActivityManager as ready (initial Firestore state loaded).
+        """
+        if not hasattr(self, 'ready_event'):
+            import threading
+            self.ready_event = threading.Event()
+        self.ready_event.set()
+
+    def wait_until_ready(self):
+        """
+        Block until the LeagueActivityManager is ready (initial Firestore state loaded).
+        """
+        if not hasattr(self, 'ready_event'):
+            import threading
+            self.ready_event = threading.Event()
+        self.ready_event.wait()
+    def update_league_flag_state(self, league_id, active):
+        """
+        Update the internal league_flag_status dict for a given league.
+        This should be called by the main dispatcher callback in main.py whenever a flag changes.
+        """
+        if not hasattr(self, 'league_flag_status'):
+            self.league_flag_status = {}
+        self.league_flag_status[str(league_id)] = active
+    def __init__(self, base_url: str, firestore_manager, watched_league_ids=None):
         self.base_url = base_url
         self.firestore_manager = firestore_manager
+        # limit auto-probe to only these leagues if provided
+        # Always probe all configured leagues for auto-probe
+        self.watched_league_ids = set(watched_league_ids) if watched_league_ids is not None else set()
+        self.auto_probe_league_ids = set(watched_league_ids) if watched_league_ids is not None else set()
+        # Event to signal the auto-probe can start (initial Firestore flags loaded)
+        import threading
+        self.ready_event = threading.Event()
         self.headers = {
             'Content-Type': 'application/json',
-            'x-api-key': os.getenv('PRIZEPICKS_SCRAPER_KEY')
+            'x-api-key': os.getenv('PRIZEPICKS_SCRAPER_KEY'),
+            "CF-Access-Client-Id": os.getenv("CF_ACCESS_CLIENT_ID"),
+            "CF-Access-Client-Secret": os.getenv("CF_ACCESS_CLIENT_SECRET")
         }
 
     async def fetch_leagues(self):
@@ -46,7 +80,7 @@ class LeagueActivityManager:
                 if league.get("attributes", {}).get("name") in valid_sports
             ]
 
-            logging.info(f"[LeagueActivityManager] Filtered leagues: {filtered_leagues}")
+        # logging.info(f"[LeagueActivityManager] Filtered leagues: {filtered_leagues}")
 
             # Further filter based on Firestore 'active' flag
             active_leagues = []
@@ -58,7 +92,7 @@ class LeagueActivityManager:
                 is_active = doc.to_dict().get('active', True) if doc.exists else True
                 if is_active:
                     active_leagues.append(league)
-            logging.info(f"[LeagueActivityManager] Active leagues after Firestore flag filter: {active_leagues}")
+            # logging.info(f"[LeagueActivityManager] Active leagues after Firestore flag filter: {active_leagues}")
             return active_leagues
         except httpx.HTTPError as e:
             logging.error(f"[LeagueActivityManager] HTTP error during fetch-leagues: {e}")
@@ -114,6 +148,10 @@ class LeagueActivityManager:
         while True:
             try:
                 leagues = await self.fetch_leagues()
+                # restrict to watched leagues if specified
+                # For auto-probe, always use all configured league IDs
+                if self.auto_probe_league_ids:
+                    leagues = [league for league in leagues if int(league.get("id", -1)) in self.auto_probe_league_ids]
                 league_map = {int(league["id"]): league for league in leagues}
 
                 for league_id, league_data in league_map.items():
@@ -160,3 +198,99 @@ class LeagueActivityManager:
         except Exception as e:
             logging.error(f"[LeagueActivityManager] Error fetching projections count for league {league_id}: {e}")
         return 0
+    
+    async def start_auto_league_probe(self):
+        """
+        Periodically probe all leagues every 2-3 minutes to update Firestore flags (only false→true). Handles log rotation and cleanup.
+        """
+        import datetime
+        import os
+        # Use logs/league_watcher/ relative to project root
+        PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        LOG_DIR = os.path.join(PROJECT_ROOT, 'logs', 'league_watcher')
+        os.makedirs(LOG_DIR, exist_ok=True)
+        current_date = datetime.datetime.now().date()
+        log_file = os.path.join(LOG_DIR, f"league_watcher_auto_{current_date}.log")
+        auto_logger = logging.getLogger('league_watcher_auto')
+        # Remove all handlers first to avoid duplicate logs
+        for h in list(auto_logger.handlers):
+            auto_logger.removeHandler(h)
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        auto_logger.addHandler(fh)
+        auto_logger.setLevel(logging.INFO)
+        auto_logger.propagate = False
+
+        def rotate_logs_if_needed():
+            nonlocal current_date, log_file, fh
+            now = datetime.datetime.now()
+            if now.date() != current_date:
+                auto_logger.info(f"Hit midnight, rotating log file to new day: {now.date()}")
+                # Remove old handler
+                auto_logger.removeHandler(fh)
+                fh.close()
+                # New file
+                current_date = now.date()
+                log_file = os.path.join(LOG_DIR, f"league_watcher_auto_{current_date}.log")
+                fh_new = logging.FileHandler(log_file, encoding='utf-8')
+                fh_new.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+                auto_logger.addHandler(fh_new)
+                fh = fh_new
+                auto_logger.info(f"Log file rotated to {log_file}")
+            # Clean up old logs (older than 7 days)
+            cutoff = now - datetime.timedelta(days=7)
+            for fname in os.listdir(LOG_DIR):
+                if fname.startswith('league_watcher_auto_') and fname.endswith('.log'):
+                    try:
+                        date_str = fname[len('league_watcher_auto_'):-4]
+                        file_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+                        if file_date < cutoff.date():
+                            os.remove(os.path.join(LOG_DIR, fname))
+                            auto_logger.info(f"Deleted old log file: {fname}")
+                    except Exception as e:
+                        auto_logger.warning(f"Failed to parse or delete log file {fname}: {e}")
+
+        auto_logger.info("Started auto league probe thread.")
+        # --- Wait until initial Firestore state is loaded before starting auto-probe loop ---
+        if not hasattr(self, 'ready_event'):
+            import threading
+            self.ready_event = threading.Event()
+        auto_logger.info("Waiting for initial Firestore state before starting auto-probe loop...")
+        self.ready_event.wait()
+        auto_logger.info("Initial Firestore state loaded. Auto-probe loop starting.")
+        while True:
+            auto_logger.info("Auto-probe cycle: starting probe")
+            try:
+                rotate_logs_if_needed()
+                auto_logger.info("Auto-probe cycle: fetching leagues from API...")
+                leagues = await self.fetch_leagues()
+                auto_logger.info(f"Auto-probe cycle: fetched {len(leagues)} leagues")
+                # restrict to watched leagues if specified
+                if self.watched_league_ids is not None:
+                    leagues = [league for league in leagues if int(league.get("id", -1)) in self.watched_league_ids]
+                for league in leagues:
+                    league_id = str(league.get("id", 0))
+                    count = league.get("attributes", {}).get("projections_count", 0)
+                    active = count > 0
+                    # Use internal league_flag_status if available
+                    existing_active = self.league_flag_status.get(league_id) if hasattr(self, 'league_flag_status') else None
+                    # Only activate if not already active (avoid duplicate True)
+                    if active and existing_active is not True:
+                        self.firestore_manager.update_league_flag(league_id, True)
+                        auto_logger.info(f"Auto-probe activated league ID {league_id} (was {existing_active})")
+                    else:
+                        auto_logger.debug(f"Auto-probe skipped league ID {league_id} (active={existing_active})")
+            except Exception as e:
+                auto_logger.error(f"Error in auto league probe: {e}")
+            # Sleep for random 2-3 minutes
+            await asyncio.sleep(random.randint(120, 180))
+
+    def start_flag_listener(self):
+        """
+        Start a Firestore listener for PrizePicksSportsFlag and update internal league_flag_status dict.
+        """
+        self.league_flag_status = {}
+        def _flag_callback(sport_name, active, league_id):
+            if league_id is not None:
+                self.league_flag_status[str(league_id)] = active
+        self.firestore_manager.listen_sports_flags(_flag_callback)

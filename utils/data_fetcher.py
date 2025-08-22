@@ -36,6 +36,8 @@ class DataFetcher:
         self.headers = {
             'Content-Type': 'application/json',
             'x-api-key': self.XAPI_KEY,
+            "CF-Access-Client-Id": os.getenv("CF_ACCESS_CLIENT_ID"),
+            "CF-Access-Client-Secret": os.getenv("CF_ACCESS_CLIENT_SECRET")
         }
 
     async def fetch_projections(self, league_id: int, platform: str) -> Dict[str, Any]:

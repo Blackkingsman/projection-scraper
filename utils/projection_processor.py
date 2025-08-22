@@ -318,20 +318,20 @@ class ProjectionProcessor:
                         if not p:
                             continue
 
-                        # Start with existing line_score_history or empty list
-                        history = p.get('line_score_history', []).copy()
+                        # Build line_score_history based on the situation
+                        history = []
                         
-                        # If this projection changed and line_score changed, append the new value
+                        # If this projection changed and line_score changed, use the history from filter_relevant_projections
                         if pid in changed_pids:
                             entry = changed_map[player_id][pid]
+                            history = entry.get('line_score_history', [])
                             changes = entry.get('changed_fields', {})
                             if 'line_score' in changes:
-                                history.append(changes['line_score']['new'])
                                 logging.info(f"[store_historical_projections] Line score changed for player {player_id}, projection {pid}: {changes['line_score']['old']} → {changes['line_score']['new']}")
                         
                         # If projection is being removed and we don't have any history yet, capture the last known line_score
                         if pid in removed and not history and 'line_score' in p:
-                            history.append(p['line_score'])
+                            history = [p['line_score']]
                             logging.info(f"[store_historical_projections] Capturing last known line_score for removed projection {pid}: {p['line_score']}")
 
                         # Build archive entry
@@ -346,7 +346,8 @@ class ProjectionProcessor:
                         to_archive[pid] = archive_entry
 
                     if to_archive:
-                        historical_data[player_id] = {"projections": to_archive}
+                        # Preserve existing player metadata and enrich projections
+                        historical_data[player_id] = {**cached_data, "projections": to_archive}
 
             if not historical_data:
                 logging.warning("[store_historical_projections] No historical data to write despite detected changes.")
@@ -382,7 +383,7 @@ class ProjectionProcessor:
             active_projection_map: Dict[str, Set[str]] = defaultdict(set)
 
             new_player_set = set()
-            changed_proj_set = set()
+            changed_proj_set = set()                                                                                      
             new_proj_set = set()
 
             league = self.firebase_manager._extract_league_from_ref(ref_path)
@@ -420,6 +421,7 @@ class ProjectionProcessor:
                         "stat_type": stat_type,
                         "status": status,
                         "game_id": game_id,  # Include game_id in the projection data
+                        "start_time": start_time,  # Include raw start_time
                         "date_key": date_key  # Include extracted date
                     }
                 else:
@@ -431,11 +433,15 @@ class ProjectionProcessor:
                         history = None
                         if 'line_score' in changed_fields:
                             history = [changed_fields['line_score']['old'], changed_fields['line_score']['new']]
+                        else:
+                            # Even if line_score didn't change, we need to capture the current line_score for history
+                            history = [line_score] if line_score is not None else None
                         filtered_projections.setdefault(player_id, {})[projection_id] = {
                             "line_score": line_score,
                             "stat_type": stat_type,
                             "status": status,
                             "game_id": game_id,  # Include game_id in the projection data
+                            "start_time": start_time,  # Include raw start_time
                             "changed_fields": changed_fields,
                             "date_key": date_key,  # Include extracted date
                             # Include optional history list

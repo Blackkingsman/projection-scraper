@@ -33,9 +33,7 @@ if __name__ == "__main__":
     # References to clear
     references = [
         "prizepicksMLB",
-        "prizepicksNFL",
-        "prizepicksNHL",
-        "prizepicksNBA"
+       
     ]
 
     # Clear the references

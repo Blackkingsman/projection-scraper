@@ -134,7 +134,9 @@ def dispatcher_callback(sport_name: str, active: bool, league_id: str, loop: asy
         return
 
     projection_ref = projection_config["ref"]
-
+    # Update LeagueActivityManager internal flag status to keep auto-probe in sync
+    league_activity_manager.update_league_flag_state(league_id, active)
+    
     if active:
         firestore_manager.update_league_flag(sport_name, active=True)
         logging.info(f"[{sport_name}] Firestore flag set to active.")
@@ -268,13 +270,30 @@ async def main_async_loop() -> None:
     realtime_listener.initial_sync_complete.wait()
     logging.info("Initial Redis cache loaded.")
 
+    # Initialize LeagueActivityManager and load initial flags
+    watched_ids = list(config["projections"].keys())  # List of league IDs for readiness
+    league_activity_manager = LeagueActivityManager(config["abbr"], firestore_manager, watched_league_ids=watched_ids)
+    # Load initial Firestore flag states and subscribe to updates (sets readiness event)
+    league_activity_manager.start_flag_listener()
+    # Start dispatcher listener for orchestration
     firestore_manager.listen_sports_flags(
         lambda sport_name, active, league_id: dispatcher_callback(
             sport_name, active, league_id, loop, league_activity_manager
         )
     )
 
-    league_activity_manager = LeagueActivityManager(config["abbr"], firestore_manager)
+    # Start auto league probe in a separate thread with dedicated file logger
+    auto_logger = logging.getLogger('league_watcher_auto')
+    if not auto_logger.handlers:
+        fh = logging.FileHandler('league_watcher_auto.log')
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        auto_logger.addHandler(fh)
+        auto_logger.setLevel(logging.INFO)
+    threading.Thread(
+        target=lambda: asyncio.run(league_activity_manager.start_auto_league_probe()),
+        daemon=True
+    ).start()
+    auto_logger.info("Started auto league probe thread.")
 
     stopped_processes = set()
 
