@@ -209,8 +209,16 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
                         await projection_processor.fetch_remaining_players(remaining_projections, projection_ref)
                     else:
                         logging.info(f"[{sport_name}] ✅ No additional projections to fetch.")
+                    
+                    # Always clean up outdated projections after processing current ones
+                    logging.info(f"[{sport_name}] Cleaning up outdated projections not in current API response.")
+                    await projection_processor.remove_outdated_projections(filtered_projections, projection_ref)
                 else:
                     logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
+                    
+                    # Still clean up outdated projections even if no changes detected
+                    logging.info(f"[{sport_name}] Cleaning up outdated projections.")
+                    await projection_processor.remove_outdated_projections({}, projection_ref)
             elif status_code == 200 and len(projections) == 0:
                 if projection_ref:
                     logging.info(f"[{sport_name}] No projections from API. Cleaning up outdated projections.")
