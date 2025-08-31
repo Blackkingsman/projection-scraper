@@ -210,12 +210,13 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
                     else:
                         logging.info(f"[{sport_name}] ✅ No additional projections to fetch.")
                     
-                    # Don't run cleanup immediately after processing changes - let the data settle
-                    logging.info(f"[{sport_name}] ✅ Processing complete. Skipping cleanup to allow data to settle.")
+                    # After processing changes, clean up outdated projections
+                    logging.info(f"[{sport_name}] Cleaning up outdated projections after processing changes.")
+                    await projection_processor.remove_outdated_projections(active_projection_map, projection_ref)
                 else:
                     logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
                     
-                    # Only run cleanup when no changes are being processed, using the SAME projection map that was filtered
+                    # Clean up outdated projections when no changes detected
                     logging.info(f"[{sport_name}] Cleaning up outdated projections since no changes detected.")
                     await projection_processor.remove_outdated_projections(active_projection_map, projection_ref)
             elif status_code == 200 and len(projections) == 0:

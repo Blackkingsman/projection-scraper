@@ -455,39 +455,6 @@ class ProjectionProcessor:
                 f"[filter_relevant_projections] New: {len(new_proj_set)}, Changed: {len(changed_proj_set)}"
             )
 
-            # Archive historical projections and remove outdated when changes detected
-            historical_ref_path = f"{ref_path}Historicals"
-            # Build map of only changed entries for history
-            changed_map: Dict[str, Dict[str, dict]] = {}
-            for player_id, proj_dict in filtered_projections.items():
-                changes = {
-                    proj_id: {**entry, "projection_id": proj_id}  # Attach projection_id
-                    for proj_id, entry in proj_dict.items()
-                    if entry.get("changed_fields")
-                }
-                if changes:
-                    changed_map[player_id] = changes
-
-            # Only archive & remove when there are actual changes
-            if changed_map:
-                # Archive historicals (handles removed entries too)
-                logging.info(f"[filter_relevant_projections] Storing historical projections for {len(changed_map)} players.")
-                asyncio.create_task(
-                    self.store_historical_projections(
-                        active_projection_map,
-                        ref_path,
-                        historical_ref_path,
-                        changed_map
-                    )
-                )
-                # Remove outdated projections
-                asyncio.create_task(
-                    self.remove_outdated_projections(
-                        active_projection_map,
-                        ref_path
-                    )
-                )
-
             return filtered_projections, dict(active_projection_map)
 
         except Exception as e:
