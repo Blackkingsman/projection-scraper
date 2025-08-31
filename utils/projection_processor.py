@@ -278,29 +278,6 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[remove_outdated_projections] Error: {e}")
 
-    def convert_projections_to_map(self, projections: list) -> Dict[str, Set[str]]:
-        """
-        Convert raw projections list to the format expected by remove_outdated_projections.
-        
-        Args:
-            projections (list): List of projections from the external API.
-            
-        Returns:
-            Dict[str, Set[str]]: Map of player IDs to sets of projection IDs.
-        """
-        projection_map = defaultdict(set)
-        
-        for proj in projections:
-            try:
-                player_id = proj['relationships']['new_player']['data']['id']
-                projection_id = proj['id']
-                projection_map[player_id].add(projection_id)
-            except (KeyError, TypeError) as e:
-                logging.warning(f"[convert_projections_to_map] Skipping invalid projection: {e}")
-                continue
-                
-        return dict(projection_map)
-
     async def store_historical_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str, historical_ref_path: str, changed_map: Optional[Dict[str, Dict]] = None) -> None:
         """
         Store historical projections in Firebase under a timestamp-based structure.
@@ -388,7 +365,7 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[store_historical_projections] Failed: {e}", exc_info=True)
 
-    def filter_relevant_projections(self, projections: list, ref_path: str) -> dict:
+    def filter_relevant_projections(self, projections: list, ref_path: str) -> tuple:
         """
         Filter projections to identify new, changed, or relevant projections.
 
@@ -397,7 +374,9 @@ class ProjectionProcessor:
             ref_path (str): Firebase reference path for projections.
 
         Returns:
-            dict: Filtered projections grouped by player ID.
+            tuple: (filtered_projections_dict, active_projection_map)
+                - filtered_projections_dict: Filtered projections grouped by player ID
+                - active_projection_map: All current projections from API (for cleanup)
         """
         logging.info("[filter_relevant_projections] Filtering projections...")
         try:
@@ -509,11 +488,11 @@ class ProjectionProcessor:
                     )
                 )
 
-            return filtered_projections
+            return filtered_projections, dict(active_projection_map)
 
         except Exception as e:
             logging.error(f"[filter_relevant_projections] Error: {e}")
-            return {}
+            return {}, {}
 
     def detect_field_changes(self, projection: dict, cached_projection: dict) -> Optional[dict]:
         """

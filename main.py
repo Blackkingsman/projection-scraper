@@ -195,7 +195,7 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
 
             if projections:
                 logging.info(f"[{sport_name}] Retrieved {len(projections)} projections.")
-                filtered_projections = projection_processor.filter_relevant_projections(projections, projection_ref)
+                filtered_projections, active_projection_map = projection_processor.filter_relevant_projections(projections, projection_ref)
                 if isinstance(filtered_projections, dict) and filtered_projections:
                     logging.info(f"[{sport_name}] 📊 Processing {len(filtered_projections)} projections.")
                     try:
@@ -215,11 +215,9 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
                 else:
                     logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
                     
-                    # Only run cleanup when no changes are being processed
+                    # Only run cleanup when no changes are being processed, using the SAME projection map that was filtered
                     logging.info(f"[{sport_name}] Cleaning up outdated projections since no changes detected.")
-                    # Convert all current projections to the format expected by cleanup
-                    all_current_projections = projection_processor.convert_projections_to_map(projections)
-                    await projection_processor.remove_outdated_projections(all_current_projections, projection_ref)
+                    await projection_processor.remove_outdated_projections(active_projection_map, projection_ref)
             elif status_code == 200 and len(projections) == 0:
                 if projection_ref:
                     logging.info(f"[{sport_name}] No projections from API. Cleaning up outdated projections.")
