@@ -213,14 +213,16 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
                     logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
             elif status_code == 200 and len(projections) == 0:
                 if projection_ref:
-                    logging.info(f"[{sport_name}] Storing historical projections and removing outdated ones.")
+                    logging.info(f"[{sport_name}] No projections from API. Cleaning up outdated projections.")
                     historical_ref_path = f"{projection_ref}Historicals"
 
                     cached_players = cache_manager.get_all_player_projections_by_league(projection_processor.firebase_manager._extract_league_from_ref(projection_ref))
 
                     if cached_players:
-                        await projection_processor.store_historical_projections({}, projection_ref, historical_ref_path)
-                        await projection_processor.remove_outdated_projections({}, projection_ref)
+                        # Pass the cached players so the cleanup functions know what to remove
+                        await projection_processor.store_historical_projections(cached_players, projection_ref, historical_ref_path)
+                        await projection_processor.remove_outdated_projections(cached_players, projection_ref)
+                        logging.info(f"[{sport_name}] Cleaned up {len(cached_players)} outdated projections.")
                     else:
                         logging.info(f"[{sport_name}] No cached data found. Signaling shutdown.")
                         process_complete_event.set()
