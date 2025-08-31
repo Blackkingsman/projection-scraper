@@ -118,8 +118,25 @@ class FirebaseManager:
         league = self._extract_league_from_ref(ref_path)
 
         for player_id, player_data in players_with_changes.items():
+            # Get existing data from Firebase for this player
+            existing_data = projection_ref.child(player_id).get() or {}
+            
+            # Update non-projection data
+            for k, v in player_data.items():
+                if k != "projections":
+                    existing_data[k] = v
+            
+            # Merge projections
+            existing_projections = existing_data.get("projections", {})
+            new_projections = player_data.get("projections", {})
+            if existing_projections:
+                existing_projections.update(new_projections)
+                merged_data = {**player_data, "projections": existing_projections}
+            else:
+                merged_data = player_data
+
             try:
-                player_json = json.dumps({player_id: player_data})
+                player_json = json.dumps({player_id: merged_data})
                 player_size = sys.getsizeof(player_json)
             except Exception as e:
                 logging.error(f"[update_projections] Serialization failed for player {player_id}: {e}")
@@ -132,6 +149,10 @@ class FirebaseManager:
                     successfully_uploaded_players.update(chunk)
 
                     for pid, pdata in chunk.items():
+                        # Debug logging for Aaron Judge cache updates
+                        if "Aaron Judge" in pdata.get("name", ""):
+                            projection_count = len(pdata.get("projections", {}))
+                            logging.info(f"[DEBUG] Updating cache for Aaron Judge ({pid}) with {projection_count} projections: {list(pdata.get('projections', {}).keys())}")
                         self.cache_manager.set_projection(pid, pdata, league)
 
                 except Exception as e:
@@ -145,11 +166,35 @@ class FirebaseManager:
 
         if chunk:
             try:
-                projection_ref.update(chunk)
-                logging.info(f"[update_projections] Uploaded final chunk with {len(chunk)} players.")
-                successfully_uploaded_players.update(chunk)
-
+                # For the final chunk, ensure we have all projections merged
+                final_chunk = {}
                 for pid, pdata in chunk.items():
+                    # Get existing data for this player
+                    existing_data = projection_ref.child(pid).get() or {}
+                    
+                    # Update non-projection data
+                    for k, v in pdata.items():
+                        if k != "projections":
+                            existing_data[k] = v
+                    
+                    # Merge projections
+                    existing_projections = existing_data.get("projections", {})
+                    new_projections = pdata.get("projections", {})
+                    if existing_projections:
+                        existing_projections.update(new_projections)
+                        final_chunk[pid] = {**pdata, "projections": existing_projections}
+                    else:
+                        final_chunk[pid] = pdata
+
+                projection_ref.update(final_chunk)
+                logging.info(f"[update_projections] Uploaded final chunk with {len(final_chunk)} players.")
+                successfully_uploaded_players.update(final_chunk)
+
+                for pid, pdata in final_chunk.items():
+                    # Debug logging for Aaron Judge cache updates
+                    if "Aaron Judge" in pdata.get("name", ""):
+                        projection_count = len(pdata.get("projections", {}))
+                        logging.info(f"[DEBUG] Updating cache for Aaron Judge ({pid}) with {projection_count} projections: {list(pdata.get('projections', {}).keys())}")
                     self.cache_manager.set_projection(pid, pdata, league)
 
             except Exception as e:

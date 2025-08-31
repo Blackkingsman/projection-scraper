@@ -232,7 +232,7 @@ class ProjectionProcessor:
             current_projection_map (Dict[str, Set[str]]): Map of current projections by player ID.
             ref_path (str): Firebase reference path for projections.
         """
-        logging.info("[remove_outdated_projections] Checking for outdated projections...")
+        logging.info(f"[remove_outdated_projections] Checking for outdated projections. Current API has {len(current_projection_map)} players with projections.")
         projections_to_remove = []
         players_to_remove_entirely = []
         league = self.firebase_manager._extract_league_from_ref(ref_path)
@@ -240,22 +240,28 @@ class ProjectionProcessor:
         try:
             # Retrieve cached player projections
             cached_players = self.cache_manager.get_all_player_projections_by_league(league)
+            logging.info(f"[remove_outdated_projections] Found {len(cached_players)} cached players in Firebase/cache for league {league}.")
 
             for player_id, cached_data in cached_players.items():
                 cached_proj_data = cached_data.get("projections", {})
                 cached_proj_ids = set(cached_proj_data.keys())
                 current_proj_ids = current_projection_map.get(player_id)
 
+                # Debug logging for specific players that might be affected
+                player_name = cached_data.get("name", "Unknown")
+                if "Aaron Judge" in player_name or "Judge" in player_name:
+                    logging.info(f"[DEBUG] Aaron Judge ({player_id}): cached_proj_ids={cached_proj_ids}, current_proj_ids={current_proj_ids}")
+
                 # Case 1 & 3: Player not in API response OR has no projections left
                 if not current_proj_ids:
                     players_to_remove_entirely.append(player_id)
-                    logging.info(f"[remove_outdated_projections] Player {player_id} has no remaining projections. Marked for full projection node removal.")
+                    logging.info(f"[remove_outdated_projections] Player {player_name} ({player_id}) has no remaining projections. Marked for full projection node removal.")
                     continue
 
                 # Case 2: Player still exists, but some projections are outdated
                 to_remove = [pid for pid in cached_proj_ids if pid not in current_proj_ids]
                 if to_remove:
-                    logging.info(f"[remove_outdated_projections] Player {player_id} projections to remove: {to_remove}")
+                    logging.info(f"[remove_outdated_projections] Player {player_name} ({player_id}) projections to remove: {to_remove}")
                     projections_to_remove.extend([(player_id, pid) for pid in to_remove])
 
             # Perform deletions
@@ -411,6 +417,10 @@ class ProjectionProcessor:
 
                 active_projection_map[player_id].add(projection_id)
 
+                # Debug logging for Aaron Judge specifically
+                if 'Aaron Judge' in str(proj.get('relationships', {}).get('new_player', {}).get('data', {})):
+                    logging.info(f"[DEBUG] Found Aaron Judge projection: {projection_id}, stat_type: {stat_type}, line_score: {line_score}")
+
                 cached_proj_data = self.cache_manager.get_projection_by_league(
                     player_id, league
                 )
@@ -454,6 +464,18 @@ class ProjectionProcessor:
             logging.info(
                 f"[filter_relevant_projections] New: {len(new_proj_set)}, Changed: {len(changed_proj_set)}"
             )
+            
+            # Debug: Log active projection map for Aaron Judge
+            for player_id, proj_ids in active_projection_map.items():
+                cached_data = self.cache_manager.get_projection_by_league(player_id, league)
+                player_name = cached_data.get("name", "Unknown") if cached_data else "Unknown"
+                if "Aaron Judge" in player_name or "Judge" in player_name:
+                    logging.info(f"[DEBUG] Active projection map for Aaron Judge ({player_id}): {proj_ids}")
+                    stat_types = []
+                    for proj in projections:
+                        if proj['relationships']['new_player']['data']['id'] == player_id:
+                            stat_types.append(f"{proj['id']}:{proj['attributes']['stat_type']}")
+                    logging.info(f"[DEBUG] Aaron Judge stat types from API: {stat_types}")
 
             return filtered_projections, dict(active_projection_map)
 

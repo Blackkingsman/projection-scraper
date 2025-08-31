@@ -141,7 +141,7 @@ class CacheManager:
 
     def set_projection(self, player_id: str, player_data: Dict[str, Any], league_abbr: str) -> bool:
         """
-        Store player projections in the cache.
+        Store player projections in the cache. Merges new projections with existing ones.
 
         Args:
             player_id (str): Player ID.
@@ -153,7 +153,28 @@ class CacheManager:
         """
         try:
             key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
-            self.cache[key] = json.dumps(player_data)
+            
+            # Get existing data
+            existing_data = {}
+            if key in self.cache:
+                try:
+                    existing_data = json.loads(self.cache[key])
+                except Exception as e:
+                    logger.error(f"[set_projection] Error loading existing data for {player_id}: {e}")
+
+            # Update player info (name, team, etc)
+            for k, v in player_data.items():
+                if k != "projections":
+                    existing_data[k] = v
+
+            # Merge projections
+            existing_projections = existing_data.get("projections", {})
+            new_projections = player_data.get("projections", {})
+            existing_projections.update(new_projections)
+            existing_data["projections"] = existing_projections
+
+            # Store merged data
+            self.cache[key] = json.dumps(existing_data)
             return True
         except Exception as e:
             logger.error(f"[set_projection] Error for {player_id}: {e}")

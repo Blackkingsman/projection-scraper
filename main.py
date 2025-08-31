@@ -210,9 +210,8 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
                     else:
                         logging.info(f"[{sport_name}] ✅ No additional projections to fetch.")
                     
-                    # After processing changes, clean up outdated projections
-                    logging.info(f"[{sport_name}] Cleaning up outdated projections after processing changes.")
-                    await projection_processor.remove_outdated_projections(active_projection_map, projection_ref)
+                    # Don't run cleanup after processing partial updates - this corrupts cache
+                    logging.info(f"[{sport_name}] ✅ Processing complete. Skipping cleanup since projections were modified.")
                 else:
                     logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
                     
