@@ -80,7 +80,17 @@ class DataFetcher:
                 response = await client.post(endpoint, headers=self.headers, json={"league_id": league_id})
 
             response.raise_for_status()
-            data = response.json().get('projections', [])
+            
+            response_json = response.json()
+            
+            # Handle new API structure - data is now directly under 'data' key
+            if "data" in response_json:
+                data = response_json["data"]
+                logging.info(f"[fetch_prizepicks_projections] Found {len(data)} projections under 'data' key")
+            else:
+                # Fallback to old structure
+                data = response_json.get('projections', [])
+                logging.info(f"[fetch_prizepicks_projections] Using fallback 'projections' key, found {len(data)} projections")
             status_code = response.status_code
 
             if data:

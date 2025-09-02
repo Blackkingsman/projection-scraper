@@ -160,7 +160,9 @@ def dispatcher_callback(sport_name: str, active: bool, league_id: str, loop: asy
                 future.result()
                 logging.info(f"Monitoring task for {sport_name} stopped successfully.")
             except asyncio.CancelledError:
-                logging.error(f"Error stopping monitoring task for {sport_name}.")
+                logging.info(f"Monitoring task for {sport_name} cancelled successfully.")
+            except Exception as e:
+                logging.error(f"Unexpected error stopping monitoring task for {sport_name}: {e}")
 
 # ------------------- Monitoring Coroutine -------------------
 
@@ -175,6 +177,9 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
         process_complete_event (threading.Event): Event to signal shutdown.
         league_activity_manager (LeagueActivityManager): Manager for league activity.
     """
+    # Create a semaphore to prevent overlapping processing operations
+    processing_semaphore = asyncio.Semaphore(1)
+    
     logging.info(f"🟢 Monitor for {sport_name} started with League ID {league_id}.")
     realtime_listener.warm_up_projections_from_firebase(projection_ref)
 
@@ -194,38 +199,43 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
                 status_code, projections = None, None
 
             if projections:
-                logging.info(f"[{sport_name}] Retrieved {len(projections)} projections.")
-                filtered_projections = projection_processor.filter_relevant_projections(projections, projection_ref)
-                if isinstance(filtered_projections, dict) and filtered_projections:
-                    logging.info(f"[{sport_name}] 📊 Processing {len(filtered_projections)} projections.")
-                    try:
-                        remaining_projections = await projection_processor.process_projections(filtered_projections, projection_ref)
-                    except Exception as e:
-                        logging.error(f"[{sport_name}] ❌ Error in process_projections: {e}")
-                        remaining_projections = None
+                async with processing_semaphore:  # Prevent overlapping processing
+                    logging.info(f"[{sport_name}] Retrieved {len(projections)} projections.")
+                    filtered_projections = await projection_processor.filter_relevant_projections(projections, projection_ref)
+                    if isinstance(filtered_projections, dict) and filtered_projections:
+                        logging.info(f"[{sport_name}] 📊 Processing {len(filtered_projections)} projections.")
+                        try:
+                            remaining_projections = await projection_processor.process_projections(filtered_projections, projection_ref)
+                        except Exception as e:
+                            logging.error(f"[{sport_name}] ❌ Error in process_projections: {e}")
+                            remaining_projections = None
 
-                    if remaining_projections:
-                        logging.info(f"[{sport_name}] 🔍 Fetching additional data for {len(remaining_projections)} players.")
-                        await projection_processor.fetch_remaining_players(remaining_projections, projection_ref)
+                        if remaining_projections:
+                            logging.info(f"[{sport_name}] 🔍 Fetching additional data for {len(remaining_projections)} players.")
+                            await projection_processor.fetch_remaining_players(remaining_projections, projection_ref)
+                        else:
+                            logging.info(f"[{sport_name}] ✅ No additional projections to fetch.")
                     else:
-                        logging.info(f"[{sport_name}] ✅ No additional projections to fetch.")
-                else:
-                    logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
+                        logging.info(f"[{sport_name}] 🔄 No relevant changes detected.")
             elif status_code == 200 and len(projections) == 0:
-                if projection_ref:
-                    logging.info(f"[{sport_name}] No projections from API. Cleaning up outdated projections.")
-                    historical_ref_path = f"{projection_ref}Historicals"
+                async with processing_semaphore:  # Prevent overlapping cleanup
+                    if projection_ref:
+                        logging.info(f"[{sport_name}] No projections from API. Cleaning up outdated projections.")
+                        historical_ref_path = f"{projection_ref}Historicals"
 
-                    cached_players = cache_manager.get_all_player_projections_by_league(projection_processor.firebase_manager._extract_league_from_ref(projection_ref))
+                        cached_players = cache_manager.get_all_player_projections_by_league(projection_processor.firebase_manager._extract_league_from_ref(projection_ref))
 
-                    if cached_players:
-                        # Pass the cached players so the cleanup functions know what to remove
-                        await projection_processor.store_historical_projections(cached_players, projection_ref, historical_ref_path)
-                        await projection_processor.remove_outdated_projections(cached_players, projection_ref)
-                        logging.info(f"[{sport_name}] Cleaned up {len(cached_players)} outdated projections.")
-                    else:
-                        logging.info(f"[{sport_name}] No cached data found. Signaling shutdown.")
-                        process_complete_event.set()
+                        if cached_players:
+                            # Pass the cached players so the cleanup functions know what to remove
+                            await projection_processor.store_historical_projections(cached_players, projection_ref, historical_ref_path)
+                            await projection_processor.remove_outdated_projections(cached_players, projection_ref)
+                            logging.info(f"[{sport_name}] Cleaned up {len(cached_players)} outdated projections.")
+                        else:
+                            logging.info(f"[{sport_name}] No cached data found. Signaling shutdown.")
+                            process_complete_event.set()
+                            shutdown_signals[sport_name] = True
+                            # Break loop after signaling shutdown
+                            break
                         shutdown_signals[sport_name] = True
                         # Break loop after signaling shutdown
                         break
@@ -242,14 +252,44 @@ async def monitor_sport(sport_name: str, league_id: str, projection_ref: str, pr
     finally:
         logging.info(f"🔚 {sport_name} monitoring task has stopped.")
 
-        if process_complete_event.is_set():
-            # One-off check of projections count for this league
+        # Quick restart check - don't hand off to league watcher if we can restart immediately
+        logging.info(f"[{sport_name}] Checking if immediate restart is needed...")
+        
+        try:
             projections_count = await league_activity_manager.get_projections_count_for_league(league_id)
-            if projections_count == 0:
-                logging.info(f"No projections for {sport_name}. Triggering update.")
-                # Update Firestore flag to inactive
-                firestore_manager.update_league_flag(sport_name, active=False)
-                logging.info(f"[{sport_name}] Shutdown complete. Firestore flag updated.")
+            logging.info(f"[{sport_name}] Final check: {projections_count} projections available")
+            
+            if projections_count > 0 and not shutdown_event.is_set():
+                # Check if there's already a task running for this sport to avoid duplicates
+                current_task = sport_tasks.get(sport_name)
+                if current_task is None or current_task.done():
+                    logging.info(f"[{sport_name}] Projections exist and no active task - starting immediate restart.")
+                    # Start new monitoring task directly AND update Firestore for external processes
+                    process_complete_event = threading.Event()
+                    current_loop = asyncio.get_running_loop()
+                    future = asyncio.run_coroutine_threadsafe(
+                        monitor_sport(sport_name, league_id, config["projections"][int(league_id)]["ref"], process_complete_event, league_activity_manager), 
+                        current_loop
+                    )
+                    sport_tasks[sport_name] = future
+                    
+                    # Update Firestore flag for external processes (but we've already started the task)
+                    # The dispatcher callback will see the task is already running and skip starting a duplicate
+                    firestore_manager.update_league_flag(sport_name, active=True)
+                    logging.info(f"[{sport_name}] Immediate restart complete - task started and Firestore updated for external processes.")
+                else:
+                    logging.info(f"[{sport_name}] Projections exist but task already running - just ensuring Firestore flag is correct.")
+                    # Task is running but make sure Firestore reflects this for external processes
+                    firestore_manager.update_league_flag(sport_name, active=True)
+            else:
+                if shutdown_event.is_set():
+                    logging.info(f"[{sport_name}] Shutdown in progress - no restart attempted.")
+                else:
+                    logging.info(f"[{sport_name}] No projections found - leaving inactive for league watcher.")
+                
+        except Exception as e:
+            logging.error(f"[{sport_name}] Error during immediate restart check: {e}")
+            logging.info(f"[{sport_name}] Restart failed, league watcher will handle recovery.")
 
 # ------------------- Main Loop -------------------
 
@@ -277,6 +317,34 @@ async def main_async_loop() -> None:
     league_activity_manager = LeagueActivityManager(config["abbr"], firestore_manager, watched_league_ids=watched_ids)
     # Load initial Firestore flag states and subscribe to updates (sets readiness event)
     league_activity_manager.start_flag_listener()
+    
+    # Do an initial league probe immediately on startup
+    logging.info("Performing initial league probe on startup...")
+    try:
+        leagues = await league_activity_manager.fetch_leagues()
+        logging.info(f"Initial probe: Found {len(leagues)} leagues from API")
+        
+        # Filter to only our watched leagues (same as auto-probe does)
+        watched_leagues = [league for league in leagues if int(league.get("id", -1)) in watched_ids]
+        logging.info(f"Initial probe: Filtered to {len(watched_leagues)} watched leagues: {watched_ids}")
+        
+        for league in watched_leagues:
+            league_id = str(league.get("id", 0))
+            league_name = league.get("attributes", {}).get("name", "Unknown")
+            count = league.get("attributes", {}).get("projections_count", 0)
+            active = count > 0
+            
+            logging.info(f"Initial probe: League {league_name} (ID: {league_id}) has {count} projections")
+            
+            if active:
+                logging.info(f"Initial probe: Activating league {league_name} (ID: {league_id}) with {count} projections...")
+                firestore_manager.update_league_flag(league_name, True)  # Use sport name, not league ID
+            else:
+                logging.info(f"Initial probe: League {league_name} (ID: {league_id}) has no projections - setting inactive")
+                firestore_manager.update_league_flag(league_name, False)  # Use sport name, not league ID
+    except Exception as e:
+        logging.error(f"Error during initial league probe: {e}")
+    
     # Start dispatcher listener for orchestration
     firestore_manager.listen_sports_flags(
         lambda sport_name, active, league_id: dispatcher_callback(
@@ -306,24 +374,22 @@ async def main_async_loop() -> None:
                 stopped_processes.add(sport_name)
 
         for sport_name in stopped_processes:
-            # Check league activity to decide on restart or shutdown
+            # Fast recovery check - don't wait 2-3 minutes for league watcher if task crashed
             league_id = firestore_manager.get_league_id(sport_name)
             # Fetch current projections count for this league
             projections_count = await league_activity_manager.get_projections_count_for_league(league_id)
             if projections_count > 0:
-                logging.info(f"Projections still active for {sport_name} (count={projections_count}), restarting monitoring task.")
-                # Restart monitoring task
-                process_complete_event = threading.Event()
-                future = asyncio.run_coroutine_threadsafe(
-                    monitor_sport(sport_name, league_id, config["projections"][int(league_id)]["ref"], process_complete_event, league_activity_manager), loop
-                )
-                sport_tasks[sport_name] = future
+                logging.info(f"Task stopped but projections still active for {sport_name} (count={projections_count}), fast recovery via Firestore update.")
+                # Fast recovery - update Firestore flag immediately, dispatcher will handle restart
+                firestore_manager.update_league_flag(sport_name, active=True)
+                logging.info(f"[{sport_name}] Fast recovery: Firestore flag updated to active - dispatcher will restart monitoring.")
                 # Clear any previous shutdown signal
                 shutdown_signals.pop(sport_name, None)
             else:
-                logging.info(f"No projections for {sport_name}. Triggering shutdown update.")
-                firestore_manager.update_league_flag(sport_name, active=False)
-                logging.info(f"[{sport_name}] Shutdown complete. Firestore flag updated.")
+                logging.info(f"Task stopped and no projections for {sport_name}. League inactive.")
+                # Don't update Firestore here - let league watcher handle deactivation timing
+                # Clear any previous shutdown signal
+                shutdown_signals.pop(sport_name, None)
          
         stopped_processes.clear()
 

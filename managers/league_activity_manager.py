@@ -59,7 +59,7 @@ class LeagueActivityManager:
         Returns:
             list: List of leagues with their projection counts.
         """
-        endpoint = "https://proxy-fetch.duckdns.org/fetch-leagues"
+        endpoint = "https://proxyfetch.philpicks.ai/fetch-leagues"
         logging.info(f"[LeagueActivityManager] Preparing to fetch leagues from hardcoded endpoint: {endpoint}")
         logging.debug(f"[LeagueActivityManager] Headers: {self.headers}")
         try:
@@ -67,9 +67,24 @@ class LeagueActivityManager:
                 response = await client.post(endpoint, headers=self.headers)
                 logging.info(f"[LeagueActivityManager] HTTP Request: POST {endpoint} - Status Code: {response.status_code}")
                 logging.debug(f"[LeagueActivityManager] Response Content: {response.text}")
+                        
             response.raise_for_status()
             logging.info(f"[LeagueActivityManager] Successfully fetched leagues from API.")
-            leagues = response.json().get("leagues", {}).get("data", [])
+            
+            response_json = response.json()
+            logging.info(f"[LeagueActivityManager] Response JSON keys: {list(response_json.keys()) if response_json else 'None'}")
+            
+            # Check different possible structures
+            leagues = None
+            if "leagues" in response_json and "data" in response_json["leagues"]:
+                leagues = response_json["leagues"]["data"]
+                logging.info(f"[LeagueActivityManager] Found leagues under 'leagues.data': {len(leagues)} items")
+            elif "data" in response_json:
+                leagues = response_json["data"]
+                logging.info(f"[LeagueActivityManager] Found leagues under 'data': {len(leagues)} items")
+            else:
+                logging.warning(f"[LeagueActivityManager] Could not find leagues in expected keys. Available keys: {list(response_json.keys())}")
+                leagues = []
 
             # Fetch the list of relevant sports from Firestore
             valid_sports = {doc.id for doc in self.firestore_manager.db.collection('PrizePicksSportsFlag').stream()}

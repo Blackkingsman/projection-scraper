@@ -238,16 +238,53 @@ class ProjectionProcessor:
         league = self.firebase_manager._extract_league_from_ref(ref_path)
 
         try:
-            # Retrieve cached player projections
+            # Retrieve cached player projections with thread safety
             cached_players = self.cache_manager.get_all_player_projections_by_league(league)
+            
+            # Debug A.J. Brown cache status
+            if "206304" in cached_players:
+                aj_cache = cached_players["206304"]
+                aj_proj_ids = set(aj_cache.get("projections", {}).keys())
+                logging.info(f"[AJ_BROWN_DEBUG] A.J. Brown in cache with projections: {aj_proj_ids} (total: {len(aj_proj_ids)})")
+            else:
+                logging.warning(f"[AJ_BROWN_DEBUG] A.J. Brown (206304) NOT found in cache!")
+            
+            # Validate current_projection_map type
+            if not isinstance(current_projection_map, dict):
+                logging.error(f"[remove_outdated_projections] Invalid current_projection_map type: {type(current_projection_map)}")
+                return
 
             for player_id, cached_data in cached_players.items():
+                if not isinstance(cached_data, dict):
+                    logging.warning(f"[remove_outdated_projections] Invalid cached_data for player {player_id}: {type(cached_data)}")
+                    continue
+                    
                 cached_proj_data = cached_data.get("projections", {})
+                if not isinstance(cached_proj_data, dict):
+                    logging.warning(f"[remove_outdated_projections] Invalid projections data for player {player_id}: {type(cached_proj_data)}")
+                    continue
+                    
                 cached_proj_ids = set(cached_proj_data.keys())
-                current_proj_ids = current_projection_map.get(player_id)
+                current_proj_ids = current_projection_map.get(player_id, set())
+                
+                # Debug A.J. Brown comparison
+                if player_id == "206304":
+                    logging.info(f"[AJ_BROWN_DEBUG] Comparison - cached_proj_ids: {cached_proj_ids}, current_proj_ids: {current_proj_ids}")
+                
+                # Ensure current_proj_ids is a set
+                if not isinstance(current_proj_ids, set):
+                    logging.warning(f"[remove_outdated_projections] Converting current_proj_ids to set for player {player_id}")
+                    current_proj_ids = set(current_proj_ids) if current_proj_ids else set()
 
                 # Case 1 & 3: Player not in API response OR has no projections left
                 if not current_proj_ids:
+                    # SAFETY CHECK: For A.J. Brown, this should NEVER happen during normal operation
+                    if player_id == "206304":
+                        logging.error(f"[AJ_BROWN_DEBUG] CRITICAL: A.J. Brown marked for full removal! This should NOT happen if projections exist on PrizePicks")
+                        logging.error(f"[AJ_BROWN_DEBUG] Cached projections: {cached_proj_ids}, Current from API: {current_proj_ids}")
+                        # Don't remove A.J. Brown entirely unless we're sure
+                        continue
+                    
                     players_to_remove_entirely.append(player_id)
                     logging.info(f"[remove_outdated_projections] Player {player_id} has no remaining projections. Marked for full projection node removal.")
                     continue
@@ -255,28 +292,44 @@ class ProjectionProcessor:
                 # Case 2: Player still exists, but some projections are outdated
                 to_remove = [pid for pid in cached_proj_ids if pid not in current_proj_ids]
                 if to_remove:
+                    # SAFETY CHECK: For A.J. Brown, validate removal is reasonable
+                    if player_id == "206304":
+                        remaining_count = len(current_proj_ids)
+                        logging.info(f"[AJ_BROWN_DEBUG] A.J. Brown partial removal - cached: {cached_proj_ids}, current: {current_proj_ids}, removing: {to_remove}, remaining: {remaining_count}")
+                        
+                        # Safety: Don't allow A.J. Brown to drop below 3 projections unless legitimately low
+                        if remaining_count < 3 and len(cached_proj_ids) >= 5:
+                            logging.error(f"[AJ_BROWN_DEBUG] SAFETY VIOLATION: A.J. Brown would drop from {len(cached_proj_ids)} to {remaining_count} projections. Blocking removal!")
+                            continue
+                    
                     logging.info(f"[remove_outdated_projections] Player {player_id} projections to remove: {to_remove}")
                     projections_to_remove.extend([(player_id, pid) for pid in to_remove])
 
-            # Perform deletions
+            # Perform deletions with error handling
             if projections_to_remove:
-                self.firebase_manager.delete_projections(projections_to_remove, ref_path)
-                logging.info(
-                    f"[remove_outdated_projections] ✅ Deleted {len(projections_to_remove)} projections "
-                    f"from {len(set(p for p, _ in projections_to_remove))} players."
-                )
+                try:
+                    self.firebase_manager.delete_projections(projections_to_remove, ref_path)
+                    logging.info(
+                        f"[remove_outdated_projections] ✅ Deleted {len(projections_to_remove)} projections "
+                        f"from {len(set(p for p, _ in projections_to_remove))} players."
+                    )
+                except Exception as e:
+                    logging.error(f"[remove_outdated_projections] Error deleting projections: {e}")
 
             if players_to_remove_entirely:
-                self.firebase_manager.delete_entire_player_nodes(players_to_remove_entirely, ref_path)
-                logging.info(
-                    f"[remove_outdated_projections] 🚫 Removed {len(players_to_remove_entirely)} full player projection nodes."
-                )
+                try:
+                    self.firebase_manager.delete_entire_player_nodes(players_to_remove_entirely, ref_path)
+                    logging.info(
+                        f"[remove_outdated_projections] 🚫 Removed {len(players_to_remove_entirely)} full player projection nodes."
+                    )
+                except Exception as e:
+                    logging.error(f"[remove_outdated_projections] Error deleting player nodes: {e}")
 
             if not projections_to_remove and not players_to_remove_entirely:
                 logging.info("[remove_outdated_projections] No projections to remove.")
 
         except Exception as e:
-            logging.error(f"[remove_outdated_projections] Error: {e}")
+            logging.error(f"[remove_outdated_projections] Error: {e}", exc_info=True)
 
     async def store_historical_projections(self, current_projection_map: Dict[str, Set[str]], ref_path: str, historical_ref_path: str, changed_map: Optional[Dict[str, Dict]] = None) -> None:
         """
@@ -365,7 +418,7 @@ class ProjectionProcessor:
         except Exception as e:
             logging.error(f"[store_historical_projections] Failed: {e}", exc_info=True)
 
-    def filter_relevant_projections(self, projections: list, ref_path: str) -> dict:
+    async def filter_relevant_projections(self, projections: list, ref_path: str) -> dict:
         """
         Filter projections to identify new, changed, or relevant projections.
 
@@ -377,6 +430,16 @@ class ProjectionProcessor:
             dict: Filtered projections grouped by player ID.
         """
         logging.info("[filter_relevant_projections] Filtering projections...")
+        
+        # Debug A.J. Brown at the very start
+        aj_brown_count = len([p for p in projections if p['relationships']['new_player']['data']['id'] == "206304"])
+        if aj_brown_count > 0:
+            logging.info(f"[AJ_BROWN_DEBUG] Found {aj_brown_count} A.J. Brown projections in raw API response")
+            aj_brown_proj_ids = [p['id'] for p in projections if p['relationships']['new_player']['data']['id'] == "206304"]
+            logging.info(f"[AJ_BROWN_DEBUG] A.J. Brown projection IDs in API: {aj_brown_proj_ids}")
+        else:
+            logging.warning(f"[AJ_BROWN_DEBUG] A.J. Brown (206304) NOT found in API response! Total projections: {len(projections)}")
+        
         try:
             logging.debug(f"[filter_relevant_projections] Projections type: {type(projections)}, Content: {projections}")
             filtered_projections = {}
@@ -388,10 +451,15 @@ class ProjectionProcessor:
 
             league = self.firebase_manager._extract_league_from_ref(ref_path)
 
+            # First pass: Build active projection map and filter projections
             for proj in projections:
                 player_id = proj['relationships']['new_player']['data']['id']
                 projection_id = proj['id']
                 logging.debug(f"[filter_relevant_projections] Processing player_id: {player_id}, projection_id: {projection_id}")
+
+                # Debug A.J. Brown specifically
+                if player_id == "206304":
+                    logging.info(f"[AJ_BROWN_DEBUG] Found A.J. Brown projection {projection_id} in API response")
 
                 line_score = proj['attributes']['line_score']
                 start_time = proj['attributes']['start_time']
@@ -405,14 +473,34 @@ class ProjectionProcessor:
                     date_key = parsed_time.strftime("%Y-%m-%d")
                 except ValueError as ve:
                     logging.error(f"[filter_relevant_projections] Invalid start_time format for projection {projection_id}: {start_time}. Error: {ve}")
+                    # Debug A.J. Brown date parsing issues
+                    if player_id == "206304":
+                        logging.error(f"[AJ_BROWN_DEBUG] Date parsing failed for A.J. Brown projection {projection_id}")
                     continue
 
+                # Track active projections
                 active_projection_map[player_id].add(projection_id)
+                
+                # Debug A.J. Brown active projections
+                if player_id == "206304":
+                    logging.info(f"[AJ_BROWN_DEBUG] Added to active_projection_map. Total for A.J. Brown: {len(active_projection_map[player_id])}")
 
                 cached_proj_data = self.cache_manager.get_projection_by_league(
                     player_id, league
                 )
                 cached_projection = cached_proj_data.get("projections", {}).get(projection_id) if cached_proj_data else None
+                
+                # Debug A.J. Brown cache lookup
+                if player_id == "206304":
+                    if cached_proj_data:
+                        cached_count = len(cached_proj_data.get("projections", {}))
+                        logging.info(f"[AJ_BROWN_DEBUG] Found {cached_count} cached projections for A.J. Brown")
+                        if cached_projection:
+                            logging.info(f"[AJ_BROWN_DEBUG] Projection {projection_id} found in cache")
+                        else:
+                            logging.info(f"[AJ_BROWN_DEBUG] Projection {projection_id} NOT found in cache (new projection)")
+                    else:
+                        logging.info(f"[AJ_BROWN_DEBUG] No cached data found for A.J. Brown")
 
                 if not cached_projection:
                     new_proj_set.add(player_id)
@@ -424,6 +512,9 @@ class ProjectionProcessor:
                         "start_time": start_time,  # Include raw start_time
                         "date_key": date_key  # Include extracted date
                     }
+                    # Debug A.J. Brown new projections
+                    if player_id == "206304":
+                        logging.info(f"[AJ_BROWN_DEBUG] New projection {projection_id} added to filtered_projections")
                 else:
                     changed_fields = self.detect_field_changes(proj['attributes'], cached_projection)
                     if changed_fields:
@@ -447,11 +538,30 @@ class ProjectionProcessor:
                             # Include optional history list
                             "line_score_history": history if history is not None else cached_projection.get('line_score_history')
                         }
+                        # Debug A.J. Brown changed projections
+                        if player_id == "206304":
+                            logging.info(f"[AJ_BROWN_DEBUG] Changed projection {projection_id} added to filtered_projections")
                         logging.debug(f"[filter_relevant_projections] Updated projection for player {player_id}, projection_id {projection_id}: {filtered_projections[player_id][projection_id]}")
+                    else:
+                        # Debug A.J. Brown unchanged projections (these are EXCLUDED from filtered_projections!)
+                        if player_id == "206304":
+                            logging.info(f"[AJ_BROWN_DEBUG] Projection {projection_id} unchanged - NOT included in filtered_projections")
 
             logging.info(
                 f"[filter_relevant_projections] New: {len(new_proj_set)}, Changed: {len(changed_proj_set)}"
             )
+
+            # Debug A.J. Brown final active projection count
+            if "206304" in active_projection_map:
+                logging.info(f"[AJ_BROWN_DEBUG] Final active_projection_map for A.J. Brown: {active_projection_map['206304']} (total: {len(active_projection_map['206304'])})")
+            else:
+                logging.warning(f"[AJ_BROWN_DEBUG] A.J. Brown (206304) NOT found in active_projection_map!")
+
+            # Debug A.J. Brown in filtered projections
+            if "206304" in filtered_projections:
+                logging.info(f"[AJ_BROWN_DEBUG] A.J. Brown in filtered_projections with {len(filtered_projections['206304'])} projections")
+            else:
+                logging.warning(f"[AJ_BROWN_DEBUG] A.J. Brown NOT in filtered_projections (no new/changed projections)")
 
             # Archive historical projections and remove outdated when changes detected
             historical_ref_path = f"{ref_path}Historicals"
@@ -466,31 +576,86 @@ class ProjectionProcessor:
                 if changes:
                     changed_map[player_id] = changes
 
-            # Only archive & remove when there are actual changes
-            if changed_map:
+            # Only archive & remove when there are actual changes OR we have removed projections
+            # IMPORTANT: Add safety check to prevent incorrect removals
+            has_removed = self._has_removed_projections(active_projection_map, league)
+            
+            # Debug A.J. Brown removal detection
+            if "206304" in active_projection_map and has_removed:
+                # Check if A.J. Brown is flagged for removal
+                cached_players = self.cache_manager.get_all_player_projections_by_league(league)
+                if "206304" in cached_players:
+                    aj_cached_ids = set(cached_players["206304"].get("projections", {}).keys())
+                    aj_current_ids = active_projection_map["206304"]
+                    aj_to_remove = aj_cached_ids - aj_current_ids
+                    if aj_to_remove:
+                        logging.warning(f"[AJ_BROWN_DEBUG] REMOVAL DETECTED! Cached: {aj_cached_ids}, Current: {aj_current_ids}, Would remove: {aj_to_remove}")
+                    
+            if changed_map or has_removed:
                 # Archive historicals (handles removed entries too)
                 logging.info(f"[filter_relevant_projections] Storing historical projections for {len(changed_map)} players.")
-                asyncio.create_task(
-                    self.store_historical_projections(
+                # Use synchronous calls to prevent race conditions
+                try:
+                    await self.store_historical_projections(
                         active_projection_map,
                         ref_path,
                         historical_ref_path,
                         changed_map
                     )
-                )
-                # Remove outdated projections
-                asyncio.create_task(
-                    self.remove_outdated_projections(
+                    # Remove outdated projections after historical storage completes
+                    await self.remove_outdated_projections(
                         active_projection_map,
                         ref_path
                     )
-                )
+                except Exception as e:
+                    logging.error(f"[filter_relevant_projections] Error in historical processing: {e}")
 
             return filtered_projections
 
         except Exception as e:
             logging.error(f"[filter_relevant_projections] Error: {e}")
             return {}
+
+    def _has_removed_projections(self, active_projection_map: Dict[str, Set[str]], league: str) -> bool:
+        """
+        Check if any projections have been removed by comparing with cached data.
+        
+        Args:
+            active_projection_map: Current active projections from API
+            league: League abbreviation
+            
+        Returns:
+            bool: True if projections have been removed
+        """
+        try:
+            cached_players = self.cache_manager.get_all_player_projections_by_league(league)
+            
+            total_removed = 0
+            for player_id, cached_data in cached_players.items():
+                cached_proj_ids = set(cached_data.get("projections", {}).keys())
+                current_proj_ids = active_projection_map.get(player_id, set())
+                
+                # If any cached projections are not in current API response, we have removals
+                removed_proj_ids = cached_proj_ids - current_proj_ids
+                if removed_proj_ids:
+                    total_removed += len(removed_proj_ids)
+                    
+                    # Special debug for A.J. Brown (player_id: 206304)
+                    if player_id == "206304":
+                        logging.warning(f"[AJ_BROWN_DEBUG] _has_removed_projections detected removal: Cached={cached_proj_ids}, Current={current_proj_ids}, ToRemove={removed_proj_ids}")
+                        # Safety check: Only proceed if we have a reasonable number of current projections
+                        if len(current_proj_ids) < 2:
+                            logging.error(f"[AJ_BROWN_DEBUG] SAFETY VIOLATION: Only {len(current_proj_ids)} current projections for A.J. Brown! Blocking removal.")
+                            return False
+                    
+            has_removed = total_removed > 0
+            if has_removed:
+                logging.info(f"[_has_removed_projections] Found {total_removed} projections to remove across all players")
+            
+            return has_removed
+        except Exception as e:
+            logging.error(f"[_has_removed_projections] Error checking for removed projections: {e}")
+            return False
 
     def detect_field_changes(self, projection: dict, cached_projection: dict) -> Optional[dict]:
         """

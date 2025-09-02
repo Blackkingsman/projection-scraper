@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from typing import Optional, Dict, Any
 from cachetools import TTLCache
 
@@ -22,6 +23,7 @@ class CacheManager:
         """
         self.cache = TTLCache(maxsize=maxsize, ttl=ttl)
         self.platform_abbr = platform_abbr.lower()
+        self._lock = threading.RLock()  # Add reentrant lock for thread safety
         logger.info(f"Initialized in-memory CacheManager for {self.platform_abbr} using cachetools")
 
     # --- General Cache Operations ---
@@ -152,9 +154,10 @@ class CacheManager:
             bool: True if successful, False otherwise.
         """
         try:
-            key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
-            self.cache[key] = json.dumps(player_data)
-            return True
+            with self._lock:
+                key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
+                self.cache[key] = json.dumps(player_data)
+                return True
         except Exception as e:
             logger.error(f"[set_projection] Error for {player_id}: {e}")
             return False
@@ -171,9 +174,10 @@ class CacheManager:
             Dict[str, Any]: Player projections if found, otherwise an empty dictionary.
         """
         try:
-            key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
-            raw = self.cache.get(key)
-            return json.loads(raw) if raw else {}
+            with self._lock:
+                key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
+                raw = self.cache.get(key)
+                return json.loads(raw) if raw else {}
         except Exception as e:
             logger.error(f"[get_projection_by_league] Error for {player_id}: {e}")
             return {}
@@ -208,12 +212,18 @@ class CacheManager:
         prefix = f"{self.platform_abbr}:projections:{league_abbr.upper()}:"
 
         try:
-            for key in self.cache.keys():
+            with self._lock:
+                # Get a snapshot of cache keys to avoid modification during iteration
+                cache_keys = list(self.cache.keys())
+                
+            for key in cache_keys:
                 if key.startswith(prefix):
                     try:
                         player_id = key.split(":")[-1]
-                        raw = self.cache[key]
-                        result[player_id] = json.loads(raw)
+                        with self._lock:
+                            raw = self.cache.get(key)
+                        if raw:  # Check if key still exists
+                            result[player_id] = json.loads(raw)
                     except Exception as inner_e:
                         logger.warning(f"[get_all_player_projections_by_league] Failed to parse key '{key}': {inner_e}")
         except Exception as e:
@@ -250,24 +260,37 @@ class CacheManager:
             league_abbr (str): League abbreviation.
         """
         try:
-            key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
+            with self._lock:
+                key = f"{self.platform_abbr}:projections:{league_abbr}:{player_id}"
 
-            if key in self.cache:
-                data = json.loads(self.cache[key])
-                projections = data.get("projections", {})
+                if key in self.cache:
+                    data = json.loads(self.cache[key])
+                    projections = data.get("projections", {})
 
-                if projection_id in projections:
-                    del projections[projection_id]
+                    # Debug A.J. Brown cache removals
+                    if player_id == "206304":
+                        logger.warning(f"[AJ_BROWN_DEBUG] Cache removal - Before: {len(projections)} projections, Removing: {projection_id}")
 
-                    if not projections:
-                        del self.cache[key]
-                        logger.info(f"[remove_projection] No more projections for {player_id}. Key removed from cache.")
+                    if projection_id in projections:
+                        del projections[projection_id]
+                        
+                        # Debug A.J. Brown cache removals
+                        if player_id == "206304":
+                            logger.warning(f"[AJ_BROWN_DEBUG] Cache removal - After: {len(projections)} projections remaining")
+
+                        if not projections:
+                            del self.cache[key]
+                            logger.info(f"[remove_projection] No more projections for {player_id}. Key removed from cache.")
+                            
+                            # Debug A.J. Brown cache removals
+                            if player_id == "206304":
+                                logger.error(f"[AJ_BROWN_DEBUG] CRITICAL: A.J. Brown cache completely cleared!")
+                        else:
+                            data["projections"] = projections
+                            self.cache[key] = json.dumps(data)
+                            logger.info(f"[remove_projection] Removed projection {projection_id} from player {player_id}.")
                     else:
-                        data["projections"] = projections
-                        self.cache[key] = json.dumps(data)
-                        logger.info(f"[remove_projection] Removed projection {projection_id} from player {player_id}.")
-                else:
-                    logger.debug(f"[remove_projection] Projection {projection_id} not found for player {player_id}.")
+                        logger.debug(f"[remove_projection] Projection {projection_id} not found for player {player_id}.")
         except Exception as e:
             logger.error(f"[remove_projection] Error removing projection {projection_id} for {player_id}: {e}")
 
@@ -286,6 +309,12 @@ class CacheManager:
         try:
             for player_id, player_data in projections_by_player.items():
                 key = f"{self.platform_abbr}:projections:{league}:{player_id}"
+                
+                # Debug A.J. Brown cache updates
+                if player_id == "206304":
+                    proj_count = len(player_data.get("projections", {}))
+                    logger.warning(f"[AJ_BROWN_DEBUG] Bulk cache update - Setting {proj_count} projections for A.J. Brown in {league}")
+                
                 self.cache[key] = json.dumps(player_data)
                 count += 1
             logging.info(f"[set_projection_bulk] Cached {count} full player records for {league.upper()} ({self.platform_abbr})")

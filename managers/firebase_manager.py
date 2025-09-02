@@ -97,7 +97,7 @@ class FirebaseManager:
 
     def update_projections(self, players_with_changes: Dict[str, Dict[str, Any]], ref_path: str, chunk_size_mb: int = 16) -> None:
         """
-        Update player projections in Firebase in chunks.
+        Update player projections in Firebase in chunks, merging with existing projections.
 
         Args:
             players_with_changes (Dict[str, Dict[str, Any]]): Players with updated projections.
@@ -118,8 +118,11 @@ class FirebaseManager:
         league = self._extract_league_from_ref(ref_path)
 
         for player_id, player_data in players_with_changes.items():
+            # CRITICAL FIX: Merge new projections with existing cache BEFORE sending to Firebase
+            merged_data = self._prepare_merged_firebase_data(player_id, player_data, league)
+            
             try:
-                player_json = json.dumps({player_id: player_data})
+                player_json = json.dumps({player_id: merged_data})
                 player_size = sys.getsizeof(player_json)
             except Exception as e:
                 logging.error(f"[update_projections] Serialization failed for player {player_id}: {e}")
@@ -131,6 +134,7 @@ class FirebaseManager:
                     logging.info(f"[update_projections] Uploaded chunk with {len(chunk)} players.")
                     successfully_uploaded_players.update(chunk)
 
+                    # Update cache with the merged data
                     for pid, pdata in chunk.items():
                         self.cache_manager.set_projection(pid, pdata, league)
 
@@ -140,7 +144,7 @@ class FirebaseManager:
                 chunk = {}
                 chunk_size = 0
 
-            chunk[player_id] = player_data
+            chunk[player_id] = merged_data
             chunk_size += player_size
 
         if chunk:
@@ -149,6 +153,7 @@ class FirebaseManager:
                 logging.info(f"[update_projections] Uploaded final chunk with {len(chunk)} players.")
                 successfully_uploaded_players.update(chunk)
 
+                # Update cache with the merged data
                 for pid, pdata in chunk.items():
                     self.cache_manager.set_projection(pid, pdata, league)
 
@@ -156,6 +161,55 @@ class FirebaseManager:
                 logging.error(f"[update_projections] Final chunk upload failed: {e}")
 
         logging.info(f"[update_projections] Total players successfully updated in Firebase: {len(successfully_uploaded_players)}")
+
+    def _prepare_merged_firebase_data(self, player_id: str, new_data: Dict[str, Any], league: str) -> Dict[str, Any]:
+        """
+        Prepare merged data for Firebase by combining existing cache projections with new data.
+        
+        Args:
+            player_id: Player ID
+            new_data: New projection data containing only new/changed projections
+            league: League abbreviation
+            
+        Returns:
+            Complete player data with all projections merged
+        """
+        try:
+            # Get existing cache data
+            existing_data = self.cache_manager.get_projection_by_league(player_id, league)
+            
+            if existing_data:
+                # Merge projections - new data takes precedence for conflicts
+                existing_projections = existing_data.get("projections", {})
+                new_projections = new_data.get("projections", {})
+                
+                # Merge the projection dictionaries
+                merged_projections = {**existing_projections, **new_projections}
+                
+                # Create merged data with updated projections and metadata
+                merged_data = {**existing_data, **new_data}
+                merged_data["projections"] = merged_projections
+                
+                # Debug A.J. Brown merging
+                if player_id == "206304":
+                    logging.warning(f"[AJ_BROWN_DEBUG] Firebase merge - existing: {len(existing_projections)}, new: {len(new_projections)}, merged: {len(merged_projections)}")
+                
+                return merged_data
+            else:
+                # No existing data, return new data as-is
+                return new_data
+                
+        except Exception as e:
+            logging.error(f"[_prepare_merged_firebase_data] Error preparing merged data for player {player_id}: {e}")
+            # Fallback to new data only
+            return new_data
+
+    def _merge_cache_projections(self, player_id: str, new_data: Dict[str, Any], league: str) -> None:
+        """
+        DEPRECATED: This method is no longer used. 
+        Merge logic is now handled in _prepare_merged_firebase_data before Firebase upload.
+        """
+        pass
 
     def set_projections(self, ref_path: str, data: Optional[Dict[str, Any]]) -> None:
         """
@@ -186,7 +240,7 @@ class FirebaseManager:
 
     def delete_projections(self, projections_to_remove: List[tuple], ref_path: str, chunk_size_mb: int = 16) -> None:
         """
-        Delete specific projections from Firebase.
+        Delete specific projections from Firebase with atomic operations.
 
         Args:
             projections_to_remove (List[tuple]): List of (player_id, projection_id) tuples to remove.
@@ -202,6 +256,7 @@ class FirebaseManager:
         max_chunk_size = chunk_size_mb * 1024 * 1024
         chunk = {}
         chunk_size = 0
+        successful_deletions = []
 
         for player_id, projection_id in projections_to_remove:
             logging.info(f"[delete_projections] Queued for deletion -> Player: {player_id}, Projection: {projection_id}")
@@ -213,29 +268,42 @@ class FirebaseManager:
                 try:
                     projection_ref.update(chunk)
                     logging.info(f"[delete_projections] Deleted {len(chunk)} projections from Firebase.")
+                    
+                    # Only update cache after successful Firebase deletion
                     for path in chunk.keys():
                         p_id, proj_id = path.split('/projections/')
                         self.cache_manager.remove_projection(p_id, proj_id, league_abbr)
+                        successful_deletions.append((p_id, proj_id))
+                        
                 except Exception as e:
                     logging.error(f"[delete_projections] Error deleting chunk of projections: {e}")
+                    # Don't update cache if Firebase operation failed
+                    
                 chunk = {}
                 chunk_size = 0
 
             chunk_size += player_size
 
+        # Handle final chunk
         if chunk:
             try:
                 projection_ref.update(chunk)
                 logging.info(f"[delete_projections] Deleted final {len(chunk)} projections from Firebase.")
+                
+                # Only update cache after successful Firebase deletion
                 for path in chunk.keys():
                     p_id, proj_id = path.split('/projections/')
                     self.cache_manager.remove_projection(p_id, proj_id, league_abbr)
+                    successful_deletions.append((p_id, proj_id))
+                    
             except Exception as e:
                 logging.error(f"[delete_projections] Error deleting remaining projections: {e}")
 
+        logging.info(f"[delete_projections] Successfully deleted {len(successful_deletions)} out of {len(projections_to_remove)} projections.")
+
     def delete_entire_player_nodes(self, player_ids: List[str], ref_path: str, chunk_size_mb: int = 16) -> None:
         """
-        Delete entire player nodes from Firebase.
+        Delete entire player nodes from Firebase with atomic operations.
 
         Args:
             player_ids (List[str]): List of player IDs to delete.
@@ -250,6 +318,7 @@ class FirebaseManager:
         max_chunk_size = chunk_size_mb * 1024 * 1024
         chunk = {}
         chunk_size = 0
+        successful_deletions = []
 
         league = self._extract_league_from_ref(ref_path)
 
@@ -263,10 +332,18 @@ class FirebaseManager:
                 player_size = sys.getsizeof(player_json)
 
                 if chunk_size + player_size > max_chunk_size:
-                    projection_ref.update(chunk)
-                    logging.info(f"[delete_entire_player_nodes] Deleted {len(chunk)} player projection nodes.")
-                    for pid in chunk.keys():
-                        self.cache_manager.remove_player_projections(pid, league)
+                    try:
+                        projection_ref.update(chunk)
+                        logging.info(f"[delete_entire_player_nodes] Deleted {len(chunk)} player projection nodes.")
+                        
+                        # Only update cache after successful Firebase deletion
+                        for pid in chunk.keys():
+                            self.cache_manager.remove_player_projections(pid, league)
+                            successful_deletions.append(pid)
+                            
+                    except Exception as e:
+                        logging.error(f"[delete_entire_player_nodes] Error deleting chunk of player nodes: {e}")
+                        
                     chunk = {}
                     chunk_size = 0
 
@@ -274,10 +351,19 @@ class FirebaseManager:
 
             # Final chunk
             if chunk:
-                projection_ref.update(chunk)
-                logging.info(f"[delete_entire_player_nodes] Deleted final {len(chunk)} player projection nodes.")
-                for pid in chunk.keys():
-                    self.cache_manager.remove_player_projections(pid, league)
+                try:
+                    projection_ref.update(chunk)
+                    logging.info(f"[delete_entire_player_nodes] Deleted final {len(chunk)} player projection nodes.")
+                    
+                    # Only update cache after successful Firebase deletion
+                    for pid in chunk.keys():
+                        self.cache_manager.remove_player_projections(pid, league)
+                        successful_deletions.append(pid)
+                        
+                except Exception as e:
+                    logging.error(f"[delete_entire_player_nodes] Error deleting remaining player nodes: {e}")
+
+            logging.info(f"[delete_entire_player_nodes] Successfully deleted {len(successful_deletions)} out of {len(player_ids)} player nodes.")
 
         except Exception as e:
             logging.error(f"[delete_entire_player_nodes] Error deleting player projection nodes: {e}")
